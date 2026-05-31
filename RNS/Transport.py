@@ -82,6 +82,11 @@ class Transport:
     PATH_REQUEST_RG             = 1.5          # Extra grace time for roaming-mode interfaces to allow more suitable peers to respond first
     PATH_REQUEST_MI             = 20           # Minimum interval in seconds for automated path requests
 
+    # MeshForge fork: overall budget (seconds) for detach_interfaces() so a busy
+    # transport node's SIGTERM teardown cannot hang the main thread. Env override:
+    # RNS_DETACH_TIMEOUT. See detach_interfaces() for the rationale.
+    DETACH_TIMEOUT              = float(os.environ.get("RNS_DETACH_TIMEOUT", 5))
+
     STATE_UNKNOWN               = 0x00
     STATE_UNRESPONSIVE          = 0x01
     STATE_RESPONSIVE            = 0x02
@@ -3116,16 +3121,39 @@ class Transport:
             except Exception as e:
                 RNS.log("An error occurred while detaching "+str(interface)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
 
+        # MeshForge fork (rnsd-SIGTERM): bound the whole detach so a busy
+        # transport node cannot hang the SIGTERM handler in the main thread.
+        # Upstream did an unbounded dt.join() plus a synchronous local-client and
+        # shared-instance detach() — any one of which blocks indefinitely if an
+        # interface's detach() stalls (a half-dead TCP uplink socket, or the
+        # shared-instance socketserver still serving clients). When that happens
+        # RNS.exit() (disk-save + os._exit) is never reached and systemd waits the
+        # full TimeoutStopSec before SIGKILL. Bounding here to DETACH_TIMEOUT lets
+        # RNS.exit() run cleanly (so state IS persisted, unlike a SIGKILL); any
+        # straggler detach thread (daemon=False above) is reaped by the os._exit()
+        # that follows. Wire format and crypto are untouched — only shutdown timing.
+        detach_deadline = time.time() + Transport.DETACH_TIMEOUT
+
         for dt in detach_threads:
-            dt.join()
+            dt.join(timeout=max(0.0, detach_deadline - time.time()))
 
-        RNS.log("Detaching local clients", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-        for li in local_interfaces:
-            li.detach()
+        def detach_local_and_shared():
+            RNS.log("Detaching local clients", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+            for li in local_interfaces:
+                try: li.detach()
+                except Exception as e: RNS.log(f"Error detaching local client interface: {e}", RNS.LOG_ERROR)
 
-        RNS.log("Detaching shared instance", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-        if shared_instance_master != None: shared_instance_master.detach()
-        BackboneInterface.deregister_listeners()
+            RNS.log("Detaching shared instance", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+            if shared_instance_master != None:
+                try: shared_instance_master.detach()
+                except Exception as e: RNS.log(f"Error detaching shared instance: {e}", RNS.LOG_ERROR)
+            BackboneInterface.deregister_listeners()
+
+        local_detach_thread = threading.Thread(target=detach_local_and_shared, daemon=True)
+        local_detach_thread.start()
+        local_detach_thread.join(timeout=max(0.0, detach_deadline - time.time()))
+        if local_detach_thread.is_alive():
+            RNS.log("Interface detach exceeded RNS_DETACH_TIMEOUT; proceeding with shutdown (stragglers reaped on exit)", RNS.LOG_WARNING)
 
         RNS.log("All interfaces detached", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
 
