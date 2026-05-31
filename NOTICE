@@ -1,0 +1,18 @@
+Reticulum (RNS) — MeshForge fork
+================================
+
+This product includes software developed by Mark Qvist as the Reticulum
+Network Stack (https://github.com/markqvist/Reticulum), used under the terms
+of the Reticulum License (see LICENSE). The upstream copyright and permission
+notice are preserved in LICENSE.
+
+Modifications by the MeshForge project (Nursedude):
+
+  - Forked at upstream tag 1.2.5 (commit e8d161c0d50cc0416c98dcd1cee44807e7c52df1).
+  - Version metadata carries a PEP 440 local marker (`+mf.N`) to distinguish
+    this fork from stock releases.
+  - See FORK.md for rationale and the wire-compatibility invariant. Per-change
+    detail is in the git history of the `meshforge` branch.
+
+No changes have been made to the cryptographic primitives or the on-wire
+protocol format; this fork remains interoperable with stock Reticulum nodes.
