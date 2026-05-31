@@ -140,6 +140,12 @@ class Reticulum:
     # latencies and use this map for global timeout calculation.
     DEFAULT_PER_HOP_TIMEOUT = 6
 
+    # MeshForge fork (#72): cap the RPC round-trip to a shared rnsd. A rnsd that
+    # accepts the RPC connection but never answers would otherwise hang recv()
+    # (and therefore rnstatus and the in-process map collector) forever. The poll
+    # bound also turns a #69-style EOF into a fast failure. Env-overridable.
+    RPC_TIMEOUT = float(os.environ.get("RNS_RPC_TIMEOUT", 8))
+
     # Length of truncated hashes in bits.
     TRUNCATED_HASHLENGTH = 128
 
@@ -1232,11 +1238,22 @@ class Reticulum:
 
     def get_rpc_client(self): return multiprocessing.connection.Client(self.rpc_addr, family=self.rpc_type, authkey=self.rpc_key)
 
+    def _rpc_recv(self, rpc_connection):
+        # MeshForge fork (#72): bound the RPC response. poll() caps the wait; on a
+        # wedged rnsd (accepts the connection but never answers) raise TimeoutError
+        # instead of hanging the calling thread forever. A closed peer (EOF) still
+        # raises EOFError from recv() -- also a fast failure, not a hang.
+        if not rpc_connection.poll(Reticulum.RPC_TIMEOUT):
+            try: rpc_connection.close()
+            except Exception: pass
+            raise TimeoutError(f"RPC response from shared instance timed out after {Reticulum.RPC_TIMEOUT}s (rnsd wedged?)")
+        return rpc_connection.recv()
+
     def _used_destination_data(self, destination_hash):
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"destination_data": "used", "destination_hash": destination_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
         
         else: return RNS.Identity._used_destination_data(destination_hash)
@@ -1245,7 +1262,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"destination_data": "retain", "destination_hash": destination_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
         
         else: return RNS.Identity._retain_destination_data(destination_hash)
@@ -1254,7 +1271,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"destination_data": "unretain", "destination_hash": destination_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
         
         else: return RNS.Identity._unretain_destination_data(destination_hash)
@@ -1266,7 +1283,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"identity_data": "retain", "identity_hash": identity_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
         
         else: return RNS.Identity._retain_identity(identity_hash)
@@ -1275,7 +1292,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "interface_stats"})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
         else:
             interfaces = []
@@ -1465,7 +1482,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "path_table", "max_hops": max_hops})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1489,7 +1506,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "rate_table"})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1510,7 +1527,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"drop": "path", "destination_hash": destination})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1520,7 +1537,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"drop": "all_via", "destination_hash": transport_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1536,7 +1553,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"drop": "announce_queues"})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1546,7 +1563,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "next_hop_if_name", "destination_hash": destination})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1557,7 +1574,7 @@ class Reticulum:
             try:
                 rpc_connection = self.get_rpc_client()
                 rpc_connection.send({"get": "first_hop_timeout", "destination_hash": destination})
-                response = rpc_connection.recv()
+                response = self._rpc_recv(rpc_connection)
 
                 if self.is_connected_to_shared_instance and hasattr(self, "_force_shared_instance_bitrate") and self._force_shared_instance_bitrate:
                     simulated_latency = ((1/self._force_shared_instance_bitrate)*8)*RNS.Reticulum.MTU
@@ -1576,7 +1593,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "next_hop", "destination_hash": destination})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
 
             return response
 
@@ -1587,7 +1604,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "link_count"})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1597,7 +1614,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "packet_rssi", "packet_hash": packet_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1611,7 +1628,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "packet_snr", "packet_hash": packet_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1625,7 +1642,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
             rpc_connection = self.get_rpc_client()
             rpc_connection.send({"get": "packet_q", "packet_hash": packet_hash})
-            response = rpc_connection.recv()
+            response = self._rpc_recv(rpc_connection)
             return response
 
         else:
@@ -1648,7 +1665,7 @@ class Reticulum:
         if self.is_connected_to_shared_instance:
                 rpc_connection = self.get_rpc_client()
                 rpc_connection.send({"get": "blackholed_identities"})
-                response = rpc_connection.recv()
+                response = self._rpc_recv(rpc_connection)
                 return response
             
         else: return RNS.Transport.blackholed_identities
@@ -1659,7 +1676,7 @@ class Reticulum:
             if self.is_connected_to_shared_instance:
                 rpc_connection = self.get_rpc_client()
                 rpc_connection.send({"blackhole_identity": identity_hash, "until": until, "reason": reason})
-                response = rpc_connection.recv()
+                response = self._rpc_recv(rpc_connection)
                 return response
             
             else: return RNS.Transport.blackhole_identity(identity_hash, until=until, reason=reason)
@@ -1670,7 +1687,7 @@ class Reticulum:
             if self.is_connected_to_shared_instance:
                 rpc_connection = self.get_rpc_client()
                 rpc_connection.send({"unblackhole_identity": identity_hash})
-                response = rpc_connection.recv()
+                response = self._rpc_recv(rpc_connection)
                 return response
             
             else: return RNS.Transport.unblackhole_identity(identity_hash)
