@@ -63,6 +63,11 @@ class LocalClientInterface(Interface):
     RECONNECT_WAIT = 8
     AUTOCONFIGURE_MTU = True
     CLIENT_SLEEP_PAUSE_TIMEOUT = 12
+    # MeshForge fork (#68): upper bound on the shared-instance / local connect().
+    # A wedged rnsd that never accepts would otherwise hang the calling thread
+    # forever in an uninterruptible kernel connect. Local connects are sub-ms, so
+    # 5s only ever trips on a genuinely wedged peer. Env-overridable for tests.
+    CONNECT_TIMEOUT = float(os.environ.get("RNS_LOCAL_CONNECT_TIMEOUT", 5))
 
     def __init__(self, owner, name, target_port = None, connected_socket=None, socket_path=None):
         super().__init__()
@@ -138,14 +143,25 @@ class LocalClientInterface(Interface):
         return False
 
     def connect(self):
+        # MeshForge fork (#68): bracket the connect() with a timeout so a wedged
+        # rnsd (accepts nothing) cannot hang this thread forever in an
+        # uninterruptible kernel connect. The timeout only covers the connect
+        # syscall; the socket is restored to blocking (timeout=None) for the
+        # subsequent read/write loop, so on-wire behaviour is unchanged. On a
+        # wedged peer connect() raises socket.timeout, which reconnect() retries
+        # and Reticulum.__init__ handles by falling back to standalone.
         if self.socket_path != None:
             self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.socket.settimeout(LocalClientInterface.CONNECT_TIMEOUT)
             self.socket.connect(self.socket_path)
-        
+            self.socket.settimeout(None)
+
         else:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.socket.settimeout(LocalClientInterface.CONNECT_TIMEOUT)
             self.socket.connect((self.target_ip, self.target_port))
+            self.socket.settimeout(None)
 
         self.online = True
         self.is_connected_to_shared_instance = True
