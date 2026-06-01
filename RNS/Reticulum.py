@@ -180,6 +180,7 @@ class Reticulum:
 
     __interface_detach_ran = False
     __exit_handler_ran = False
+    __shutdown_started = False
     @staticmethod
     def exit_handler():
         # This exit handler is called whenever Reticulum is asked to
@@ -198,16 +199,35 @@ class Reticulum:
             RNS._detach_stdout()
 
     @staticmethod
-    def sigint_handler(signal, frame):
+    def __deferred_shutdown():
+        # MeshForge mf.4: teardown runs OFF signal context (in its own thread)
+        # so a signal that interrupts a lock-holding RNS.log() on the main
+        # thread does not deadlock — the main thread resumes, finishes the
+        # interrupted log(), and releases logging_lock, after which
+        # detach_interfaces()'s own worker can acquire it. RNS.exit() then
+        # reaches os._exit() to terminate the process.
         RNS.Transport.detach_interfaces()
         Reticulum.__interface_detach_ran = True
         RNS.exit()
 
     @staticmethod
+    def __spawn_shutdown():
+        # Async-signal-safe: a signal handler must not perform heavy,
+        # lock-acquiring teardown (detach_interfaces -> joins a worker that
+        # calls RNS.log()). Spawn a thread and return immediately. Guarded so
+        # repeated SIGINT/SIGTERM cannot start multiple shutdown threads.
+        if Reticulum.__shutdown_started: return
+        Reticulum.__shutdown_started = True
+        threading.Thread(target=Reticulum.__deferred_shutdown,
+                         name="rns-signal-shutdown", daemon=True).start()
+
+    @staticmethod
+    def sigint_handler(signal, frame):
+        Reticulum.__spawn_shutdown()
+
+    @staticmethod
     def sigterm_handler(signal, frame):
-        RNS.Transport.detach_interfaces()
-        Reticulum.__interface_detach_ran = True
-        RNS.exit()
+        Reticulum.__spawn_shutdown()
 
     @staticmethod
     def get_instance():

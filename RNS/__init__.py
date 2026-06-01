@@ -91,7 +91,12 @@ instance_random.seed(os.urandom(10))
 
 _always_override_destination = False
 
-logging_lock = threading.Lock()
+# MeshForge mf.4 (Issue #68-class): reentrant so log()'s on-write-failure
+# fallback — the LOG_FILE / LOG_CALLBACK except branches re-call log() while
+# still holding this lock — cannot self-deadlock. A plain (non-reentrant) Lock
+# wedged the main thread inside log() whenever a logfile write failed (e.g. bad
+# perms), which is the lock-held window the rnsd-SIGTERM hang landed in.
+logging_lock = threading.RLock()
 
 def loglevelname(level):
     if (level == LOG_CRITICAL):
