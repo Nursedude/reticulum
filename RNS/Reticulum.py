@@ -443,6 +443,13 @@ class Reticulum:
                         socket_path=self.local_socket_path)
                     interface.target_port = self.local_interface_port
                     interface.OUT = True
+                    # MeshForge fork (mf.5, #69): this branch is only reached when
+                    # share_instance=True and the host bind failed — record that
+                    # this process WANTED the host role so the client interface can
+                    # escalate (exit-to-restart, opt-in via RNS_EXIT_ON_HOST_LOSS=1)
+                    # if the actual host later dies, instead of reconnect-looping
+                    # at a dead socket forever.
+                    interface.wanted_host = True
                     if hasattr(Reticulum, "_force_shared_instance_bitrate"):
                         interface.bitrate = Reticulum._force_shared_instance_bitrate
                         interface._force_bitrate = True

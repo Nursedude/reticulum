@@ -68,6 +68,16 @@ class LocalClientInterface(Interface):
     # forever in an uninterruptible kernel connect. Local connects are sub-ms, so
     # 5s only ever trips on a genuinely wedged peer. Env-overridable for tests.
     CONNECT_TIMEOUT = float(os.environ.get("RNS_LOCAL_CONNECT_TIMEOUT", 5))
+    # MeshForge fork (mf.5, #69): a process that WANTED to host the shared
+    # instance (share_instance=True, lost the bind race) must not reconnect-loop
+    # forever at a dead socket once the transient claimant dies — that leaves
+    # the box with NO host until manual intervention. After this many failed
+    # reconnect attempts (RECONNECT_WAIT apart, ~24s at defaults) the interface
+    # verifies the abstract socket has no listener at all and, if the opt-in
+    # env RNS_EXIT_ON_HOST_LOSS=1 is set, exits nonzero so the service manager
+    # restarts the process into a fresh init that takes the host path cleanly.
+    HOST_LOSS_EXIT_ATTEMPTS = int(os.environ.get("RNS_HOST_LOSS_EXIT_ATTEMPTS", 3))
+    HOST_LOSS_EXIT_CODE = 75  # EX_TEMPFAIL — nonzero so Restart=on-failure fires
 
     def __init__(self, owner, name, target_port = None, connected_socket=None, socket_path=None):
         super().__init__()
@@ -86,6 +96,7 @@ class LocalClientInterface(Interface):
         self.reconnecting     = False
         self.never_connected  = True
         self.detached         = False
+        self.wanted_host      = False
         self.name             = name
         self.mode             = RNS.Interfaces.Interface.Interface.MODE_FULL
         self.frame_buffer     = b""
@@ -173,6 +184,47 @@ class LocalClientInterface(Interface):
         return True
 
 
+    def _local_listener_present(self):
+        # MeshForge fork (mf.5, #69): definitive "is anyone hosting?" check for
+        # the abstract-socket shared instance. Scans /proc/net/unix for a
+        # LISTEN-state (St=01) entry under this instance's abstract name.
+        # Returns True/False, or None when it cannot tell (non-abstract
+        # transport, /proc unreadable) — callers must NEVER treat None as
+        # absence: unknown is not gone.
+        if self.socket_path is None or not self.socket_path.startswith("\0"):
+            return None
+        name = "@" + self.socket_path[1:]
+        try:
+            with open("/proc/net/unix", "r") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 8 and parts[7] == name and parts[5] == "01":
+                        return True
+            return False
+        except Exception:
+            return None
+
+    def _exit_if_host_lost(self, attempts):
+        # MeshForge fork (mf.5, #69): exit-to-restart escalation for a
+        # wanted-host client whose host died. Fires only when ALL of:
+        # this process wanted the host role (set by Reticulum's client-fallback
+        # branch), the opt-in env is set (rnsd unit only — embedded clients
+        # keep stock reconnect-forever behaviour), enough attempts have failed,
+        # and the abstract socket provably has NO listener (host GONE, not
+        # merely busy restarting — a rebinding host is joined normally on the
+        # next attempt). Exit is nonzero so systemd restarts the process; the
+        # fresh init takes the host path, or joins cleanly if a new host
+        # appeared meanwhile. Pure local-IPC behaviour, no wire change.
+        if not getattr(self, "wanted_host", False): return
+        if os.environ.get("RNS_EXIT_ON_HOST_LOSS", "0") != "1": return
+        if attempts < LocalClientInterface.HOST_LOSS_EXIT_ATTEMPTS: return
+        if self._local_listener_present() is not False: return
+        RNS.log("The local shared instance host for "+str(self)+" is gone and no listener "+
+                "remains after "+str(attempts)+" reconnect attempts. This process wanted to "+
+                "host the shared instance; exiting (code "+str(LocalClientInterface.HOST_LOSS_EXIT_CODE)+
+                ") so the service manager can restart it into the host role.", RNS.LOG_CRITICAL)
+        RNS.exit(LocalClientInterface.HOST_LOSS_EXIT_CODE)
+
     def reconnect(self):
         if self.is_connected_to_shared_instance:
             if not self.reconnecting:
@@ -188,6 +240,7 @@ class LocalClientInterface(Interface):
 
                     except Exception as e:
                         RNS.log("Connection attempt for "+str(self)+" failed: "+str(e), RNS.LOG_DEBUG)
+                        self._exit_if_host_lost(attempts)
 
                 if not self.never_connected:
                     RNS.log("Reconnected socket for "+str(self)+".", RNS.LOG_INFO)
