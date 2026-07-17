@@ -137,14 +137,18 @@ def log(msg, level=3, _override_destination = False, pt=False):
             if not compact_log_fmt: logstring = ("["+timestamp_str(time.time())+"] " if logtimestamps else "")+loglevelname(level)+" "+msg
             else:                   logstring = ("["+timestamp_str(time.time())+"] " if logtimestamps else "")+msg
 
-        # MeshForge mf.4 (re-ported for 1.3.8): upstream's on-write-failure
-        # fallback re-calls log() while still holding logging_lock, which
-        # self-deadlocks a plain (non-reentrant) Lock — the lock-held window the
-        # rnsd-SIGTERM hang landed in. Rather than widen the lock to an RLock
-        # (per-acquire overhead on the hot path), record the failure inside the
-        # lock and run the reentrant re-log AFTER releasing it (fresh acquire,
-        # no reentry). Normal logging is byte-for-byte the upstream path.
+        # MeshForge mf.4 (re-ported for 1.3.8): two reentry paths would
+        # self-deadlock a plain (non-reentrant) logging_lock — the lock-held
+        # window the rnsd-SIGTERM hang landed in — because they re-call log()
+        # while the lock is held: (1) the on-write-failure fallback, and (2) a
+        # LOG_CALLBACK handler that logs synchronously. The original mf.4 widened
+        # the lock to an RLock; that added per-acquire overhead on the hot path
+        # (flaked LOG_EXTREME resource transfers on 1.3.8), so instead both
+        # reentrant paths run AFTER the lock is released (fresh acquire, no
+        # reentry): record the fallback error / defer the callback dispatch.
+        # Normal LOG_FILE/LOG_STDOUT logging is byte-for-byte the upstream path.
         _log_fallback = None
+        _do_callback = False
         with logging_lock:
             if (logdest == LOG_STDOUT or _always_override_destination or _override_destination):
                 if not threading.main_thread().is_alive(): return
@@ -165,10 +169,17 @@ def log(msg, level=3, _override_destination = False, pt=False):
                     _log_fallback = "Exception occurred while writing log message to log file: "+str(e)
 
             elif logdest == LOG_CALLBACK:
-                try: logcall(logstring)
-                except Exception as e:
-                    _always_override_destination = True
-                    _log_fallback = "Exception occurred while calling external log handler: "+str(e)
+                _do_callback = True
+
+        if _do_callback:
+            # Dispatched outside the lock: a handler that calls RNS.log()
+            # synchronously would re-enter the plain Lock on this thread and
+            # self-deadlock (a well-behaved callback must be thread-safe, as it
+            # is no longer serialized against concurrent log() callers).
+            try: logcall(logstring)
+            except Exception as e:
+                _always_override_destination = True
+                _log_fallback = "Exception occurred while calling external log handler: "+str(e)
 
         if _log_fallback is not None:
             # Lock released — these re-acquire it fresh (no self-deadlock).

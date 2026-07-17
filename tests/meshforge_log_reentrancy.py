@@ -62,6 +62,45 @@ class MeshForgeLogReentrancyTest(unittest.TestCase):
             (RNS.loglevel, RNS.logdest, RNS.logfile,
              RNS._always_override_destination) = saved
 
+    def test_log_does_not_deadlock_when_callback_re_logs(self):
+        # 1.3.8 re-port coverage: a LOG_CALLBACK handler that calls RNS.log()
+        # synchronously must NOT self-deadlock the plain (non-reentrant) Lock.
+        # The original mf.4 RLock covered this reentry; the plain-Lock re-port
+        # must preserve it structurally (dispatch the callback OUTSIDE the lock).
+        saved = (RNS.loglevel, RNS.logdest, RNS.logfile,
+                 RNS.logcall, RNS._always_override_destination)
+        try:
+            RNS.loglevel = RNS.LOG_DEBUG
+            RNS.logdest = RNS.LOG_CALLBACK
+            RNS._always_override_destination = False
+            seen = []
+
+            def handler(logstring):
+                # A handler that re-enters log() while it runs.
+                if len(seen) < 1:
+                    seen.append(logstring)
+                    RNS.log("reentrant-from-callback", RNS.LOG_DEBUG)
+
+            RNS.logcall = handler
+            done = {}
+
+            def call():
+                RNS.log("trigger-callback-reentry", RNS.LOG_CRITICAL)
+                done["ok"] = True
+
+            th = threading.Thread(target=call, daemon=True)
+            th.start()
+            th.join(timeout=5)
+            self.assertFalse(
+                th.is_alive(),
+                "log() deadlocked when a LOG_CALLBACK handler re-logged",
+            )
+            self.assertTrue(done.get("ok"))
+            self.assertEqual(len(seen), 1)
+        finally:
+            (RNS.loglevel, RNS.logdest, RNS.logfile,
+             RNS.logcall, RNS._always_override_destination) = saved
+
     # ---- Part B: signal handlers must defer teardown off signal context ----
     def _reset_shutdown_guard(self):
         setattr(Reticulum, "_Reticulum__shutdown_started", False)
