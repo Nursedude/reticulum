@@ -48,10 +48,11 @@ class Interface:
     MODE_ROAMING        = 0x04
     MODE_BOUNDARY       = 0x05
     MODE_GATEWAY        = 0x06
+    MODE_INTERNAL       = 0x07
 
     # Which interface modes a Transport Node should
     # actively discover paths for.
-    DISCOVER_PATHS_FOR  = [MODE_ACCESS_POINT, MODE_GATEWAY, MODE_ROAMING]
+    DISCOVER_PATHS_FOR  = [MODE_ACCESS_POINT, MODE_GATEWAY, MODE_ROAMING, MODE_INTERNAL]
 
     # How many samples to use for announce
     # frequency calculations
@@ -106,6 +107,8 @@ class Interface:
         self.discoverable             = False
         self.last_discovery_announce  = 0
         self.bootstrap_only           = False
+        self.recursive_prs            = False
+        self.announces_from_internal  = True
         self.parent_interface         = None
         self.spawned_interfaces       = None
         self.tunnel_id                = None
@@ -197,28 +200,17 @@ class Interface:
 
     def optimise_mtu(self):
         if self.AUTOCONFIGURE_MTU:
-            if self.bitrate   >= 1_000_000_000:
-                self.HW_MTU = 524288
-            elif self.bitrate > 750_000_000:
-                self.HW_MTU = 262144
-            elif self.bitrate > 400_000_000:
-                self.HW_MTU = 131072
-            elif self.bitrate > 200_000_000:
-                self.HW_MTU = 65536
-            elif self.bitrate > 100_000_000:
-                self.HW_MTU = 32768
-            elif self.bitrate > 10_000_000:
-                self.HW_MTU = 16384
-            elif self.bitrate > 5_000_000:
-                self.HW_MTU = 8192
-            elif self.bitrate > 2_000_000:
-                self.HW_MTU = 4096
-            elif self.bitrate > 1_000_000:
-                self.HW_MTU = 2048
-            elif self.bitrate > 62_500:
-                self.HW_MTU = 1024
-            else:
-                self.HW_MTU = None
+            if self.bitrate   >= 1_000_000_000:  self.HW_MTU = 524288
+            elif self.bitrate > 750_000_000:     self.HW_MTU = 262144
+            elif self.bitrate > 400_000_000:     self.HW_MTU = 131072
+            elif self.bitrate > 200_000_000:     self.HW_MTU = 65536
+            elif self.bitrate > 100_000_000:     self.HW_MTU = 32768
+            elif self.bitrate > 10_000_000:      self.HW_MTU = 16384
+            elif self.bitrate > 5_000_000:       self.HW_MTU = 8192
+            elif self.bitrate > 2_000_000:       self.HW_MTU = 4096
+            elif self.bitrate > 1_000_000:       self.HW_MTU = 2048
+            elif self.bitrate > 62_500:          self.HW_MTU = 1024
+            else:                                self.HW_MTU = None
 
         RNS.log(f"{self} hardware MTU set to {self.HW_MTU}", RNS.LOG_DEBUG)
 
@@ -226,7 +218,9 @@ class Interface:
         return time.time()-self.created
 
     def hold_announce(self, announce_packet):
-        if announce_packet.destination_hash in self.held_announces:
+        if announce_packet.hops >= RNS.Transport.PATHFINDER_M-1:
+            return
+        elif announce_packet.destination_hash in self.held_announces:
             self.held_announces[announce_packet.destination_hash] = announce_packet
         elif not len(self.held_announces) >= self.ic_max_held_announces:
             self.held_announces[announce_packet.destination_hash] = announce_packet

@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 import RNS  # noqa: F401
+import RNS.vendor.umsgpack as mp
 from RNS.Reticulum import Reticulum
 
 
@@ -14,21 +15,22 @@ class MeshForgeRpcTimeoutTest(unittest.TestCase):
         self.assertGreater(Reticulum.RPC_TIMEOUT, 0)
 
     def test_rpc_recv_returns_response_when_ready(self):
+        # 1.3.8 msgpack byte-mode framing: _rpc_recv unpacks recv_bytes().
         conn = mock.MagicMock()
         conn.poll.return_value = True
-        conn.recv.return_value = {"ok": 1}
+        conn.recv_bytes.return_value = mp.packb({"ok": 1})
         # self is unused by _rpc_recv; pass None to avoid building a Reticulum.
         result = Reticulum._rpc_recv(None, conn)
         self.assertEqual(result, {"ok": 1})
         conn.poll.assert_called_once_with(Reticulum.RPC_TIMEOUT)
-        conn.recv.assert_called_once()
+        conn.recv_bytes.assert_called_once()
 
     def test_rpc_recv_raises_timeout_and_closes_when_no_response(self):
         conn = mock.MagicMock()
         conn.poll.return_value = False  # wedged rnsd: accepted, never answers
         with self.assertRaises(TimeoutError):
             Reticulum._rpc_recv(None, conn)
-        conn.recv.assert_not_called()   # must NOT block on recv
+        conn.recv_bytes.assert_not_called()  # must NOT block on recv_bytes
         conn.close.assert_called_once()  # connection is released
 
 

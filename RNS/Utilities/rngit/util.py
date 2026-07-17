@@ -133,6 +133,10 @@ class MarkdownToMicron:
         self.__local_url_scope = self.local_url_scope
         self.syntax_highlighter = syntax_highlighter
         self.wcwidth = None
+
+        self.bold_links = True
+        self.underline_links = True
+        self.link_color = None
         
         try:
             import wcwidth
@@ -204,19 +208,21 @@ class MarkdownToMicron:
             code_content = '\n'.join(code_buffer)
             
             if self.syntax_highlighter and code_block_lang:
-                try:
-                    highlighted = self.syntax_highlighter.highlight(code_content, language=code_block_lang)
-                    result_lines.append(f"{self.CODE_BG}{self.CODE_FG}")
-                    result_lines.append(highlighted)
-                    result_lines.append(self.CODE_RESET)
+                if code_block_lang.lower() == "rawmu": result_lines.append(code_content)
+                else:
+                    try:
+                        highlighted = self.syntax_highlighter.highlight(code_content, language=code_block_lang)
+                        result_lines.append(f"{self.CODE_BG}{self.CODE_FG}")
+                        result_lines.append(highlighted)
+                        result_lines.append(self.CODE_RESET)
 
-                except Exception:
-                    # Fallback to plain literal block on any error
-                    result_lines.append(f"{self.CODE_BG}{self.CODE_FG}")
-                    result_lines.append(self.LITERAL_START)
-                    result_lines.append(self._escape_literals(code_content))
-                    result_lines.append(self.LITERAL_END)
-                    result_lines.append(self.CODE_RESET)
+                    except Exception:
+                        # Fallback to plain literal block on any error
+                        result_lines.append(f"{self.CODE_BG}{self.CODE_FG}")
+                        result_lines.append(self.LITERAL_START)
+                        result_lines.append(self._escape_literals(code_content))
+                        result_lines.append(self.LITERAL_END)
+                        result_lines.append(self.CODE_RESET)
             else:
                 result_lines.append(f"{self.CODE_BG}{self.CODE_FG}")
                 result_lines.append(self.LITERAL_START)
@@ -343,8 +349,15 @@ class MarkdownToMicron:
                 url = f"{self.local_url_scope}{url}"
                 if anchor: url = f"{url}|anchor={anchor}"
 
+            undl = "`_" if self.underline_links else ""
+            bold = "`!" if self.bold_links else ""
             text = text.replace('`', '')
-            return f"`!`[{text}`{url}]`!"
+            link = f"{undl}{bold}`[{text}`{url}]{bold}{undl}"
+
+            if self.link_color and len(self.link_color) == 3: link = f"`F{self.link_color}{link}`f"
+            if self.link_color and len(self.link_color) == 6: link = f"`FT{self.link_color}{link}`f"
+
+            return link
         
         text = re.sub(r'\x00LINK(\d+)\x00', restore_link, text)
         
@@ -673,19 +686,64 @@ class MarkdownToMicron:
             return " " * left + text + " " * right
         else:
             return text + " " * padding
-    
+
     def _truncate_cell(self, text, width):
         if self._visible_width(text) <= width: return text
-        
-        stripped = text
-        stripped = re.sub(r'`[FB][0-9a-fA-F]{3}', '', stripped)
-        stripped = re.sub(r'`[!*_]', '', stripped)
-        stripped = re.sub(r'`f`b', '', stripped)
-        
-        if len(stripped) <= width - 1: return text
-        
-        truncated = stripped[:width - 1] + "…"
-        return truncated
+
+        truncation_point = len(text)
+        while truncation_point > 0 and self._visible_width(text[0:truncation_point]) >= width:
+            truncation_point -= 1
+
+        truncated = text[:truncation_point]
+
+        # Yes, this is convoluted, but if someone else has
+        # a better idea on how to handle unclosed micron
+        # tags in the truncated cells, I'm all ears.
+        active_tags = set()
+        fg_active = False
+        bg_active = False
+
+        i = 0
+        while i < len(truncated):
+            if truncated[i] == '`':
+                if i + 1 < len(truncated):
+                    tag_char = truncated[i + 1]
+
+                    if tag_char in '!*_=':
+                        if tag_char in active_tags: active_tags.remove(tag_char)
+                        else:                       active_tags.add(tag_char)
+                        i += 2
+                        continue
+
+                    elif tag_char == 'f':
+                        fg_active = False
+                        i += 2
+                        continue
+
+                    elif tag_char == 'b':
+                        bg_active = False
+                        i += 2
+                        continue
+
+                    elif tag_char == 'F':
+                        fg_active = True
+                        if i + 2 < len(truncated) and truncated[i + 2] == 'T': i += 8
+                        else:                                                  i += 5
+                        continue
+
+                    elif tag_char == 'B':
+                        bg_active = True
+                        if i + 2 < len(truncated) and truncated[i + 2] == 'T': i += 8
+                        else:                                                  i += 5
+                        continue
+            i += 1
+
+        closers = []
+        if fg_active: closers.append('`f')
+        if bg_active: closers.append('`b')
+        for fmt in active_tags: closers.append(f'`{fmt}')
+
+        return truncated + ''.join(closers) + "…"
     
     def _wrap_text(self, text, width):
         if not text: return [""]

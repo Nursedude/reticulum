@@ -11,6 +11,7 @@ LINE_START_PATTERNS = [
 ]
 
 LINE_ANY_PATTERNS = [
+    # r'<br/>',
     # r'<div[^>]*>',
     # r'</div>',
 ]
@@ -36,6 +37,10 @@ def should_remove_line(line, start_patterns, any_patterns):
 
 
 def clean_markdown_content(content, start_patterns, any_patterns, api_ref=False):
+    content = content.replace("**\n  : ", "**\n    ")
+    content = content.replace("\n* **", "\n\n* **")
+    content = content.replace("\n\n\n", "\n\n")
+    
     lines = content.split('\n')
     result = []
     skip_next_empty = False
@@ -56,6 +61,8 @@ def clean_markdown_content(content, start_patterns, any_patterns, api_ref=False)
                 if line.startswith("### "): line = line.replace("### ", "### `")
                 if line.startswith("#### "): line = line.replace("#### ", "#### `")
                 line = f"{line}`"
+
+        line = line.replace("<br/>", "")
 
         result.append(line)
     

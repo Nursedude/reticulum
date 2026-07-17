@@ -1,22 +1,22 @@
 >> Reticulum Network Stack
 
-To understand the foundational philosophy and goals of this system, read the `!`[Zen of Reticulum`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=Zen+of+Reticulum.md]`!.
+To understand the foundational philosophy and goals of this system, read the `_`!`[Zen of Reticulum`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=Zen+of+Reticulum.md]`!`_.
 
 Reticulum is the cryptography-based networking stack for building local and wide-area networks with readily available hardware. It can operate even with very high latency and extremely low bandwidth. Reticulum allows you to build wide-area networks with off-the-shelf tools, and offers end-to-end encryption and connectivity, initiator anonymity, autoconfiguring cryptographically backed multi-hop transport, efficient addressing, unforgeable delivery acknowledgements and more.
 
-The vision of Reticulum is to allow anyone to be their own network operator, and to make it cheap and easy to cover vast areas with a myriad of independent, inter-connectable and autonomous networks. Reticulum **is not** *one* network. It is **a tool** for building *thousands of networks*. Networks without kill-switches, surveillance, censorship and control. Networks that can freely interoperate, associate and disassociate with each other, and require no central oversight. Networks for human beings. *Networks for the people*.
+The vision of Reticulum is to allow anyone to be their own network operator, and to make it cheap and easy to cover vast areas with a myriad of independent, inter-connectable and autonomous networks. Reticulum `!is not`! `*one`* network. It is `!a tool`! for building `*thousands of networks`*. Networks without kill-switches, surveillance, censorship and control. Networks that can freely interoperate, associate and disassociate with each other, and require no central oversight. Networks for human beings. `*Networks for the people`*.
 
 Reticulum is a complete networking stack, and does not rely on IP or higher layers, but it is possible to use IP as the underlying carrier for Reticulum. It is therefore trivial to tunnel Reticulum over the Internet or private IP networks.
 
 Having no dependencies on traditional networking stacks frees up overhead that has been used to implement a networking stack built directly on cryptographic principles, allowing resilience and stable functionality, even in open and trustless networks.
 
-No kernel modules or drivers are required. Reticulum runs completely in userland, and can run on practically any system that runs Python 3.
+No kernel modules or drivers are required. Reticulum runs completely in userland, and can run on practically any system that runs Python.
 
 >> Read The Manual
 
-The full documentation for Reticulum is available on `!`[this node`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/index.md]`!.
+The full documentation for Reticulum is available on `_`!`[this node`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/index.md]`!`_.
 
-You can also download the `!`[Reticulum manual as a PDF`:/file/download`g=reticulum|r=reticulum|ref=HEAD|path=docs%2FReticulum+Manual.pdf]`! or `!`[as an e-book in EPUB format`:/file/download`g=reticulum|r=reticulum|ref=HEAD|path=docs%2FReticulum+Manual.pdf]`!.
+You can also download the `_`!`[Reticulum manual as a PDF`:/file/artifact`g=reticulum|r=reticulum|t=latest|a=Reticulum+Manual.pdf]`!`_ or `_`!`[as an e-book in EPUB format`:/file/artifact`g=reticulum|r=reticulum|t=latest|a=Reticulum+Manual.epub]`!`_.
 
 >> Notable Features
 
@@ -58,6 +58,12 @@ You can also download the `!`[Reticulum manual as a PDF`:/file/download`g=reticu
 
 The Python code in this repository is the Reference Implementation of Reticulum. The Reticulum Protocol is defined entirely and authoritatively by this reference implementation, and its associated manual. It is maintained by Mark Qvist, identified by the Reticulum Identity `B333<bc7291552be7a58f361522990465165c>`b.
 
+No second-order protocol specification derivatives currently do, or will ever exist. You can't get a better specification than one that is executable, functional, testable, deployed and operating 24/7 across the planet.
+
+There is not, and never will be a separate, derived "formal spec", "RFC" or anything similar for Reticulum:
+
+`!The reference implementation `*is`* the final, authoritative specification.`!
+
 Compatibility with the Reticulum Protocol is defined as having full interoperability, and sufficient functional parity with this reference implementation. Any specific protocol implementation that achieves this is Reticulum. Any that does not is not Reticulum.
 
 The reference implementation is licensed under the Reticulum License.
@@ -66,33 +72,31 @@ The Reticulum Protocol was dedicated to the Public Domain in 2016.
 
 >> Examples of Reticulum Applications
 
-If you want to quickly get an idea of what Reticulum can do, take a look at the [Programs Using Reticulum](https://reticulum.network/manual/software.html) section of the manual, or the following resources:
+If you want to quickly get an idea of what Reticulum can do, take a look at the `_`!`[Programs Using Reticulum`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/software.md]`!`_ section of the manual, or the following resources:
 
-• [LXMF](https://github.com/markqvist/lxmf) is a distributed, delay and disruption tolerant message transfer
-  protocol built on Reticulum
+• `_`!`[LXMF`a8d24177d946de4f1f0a0fe1af9a1338:/page/repo.mu`g=reticulum|r=lxmf]`!`_ is a distributed, delay and disruption tolerant message transfer protocol built on Reticulum
 
-• The [LXST](https://github.com/markqvist/lxst) protocol and framework provides real-time audio and signals
-  transport over Reticulum. It includes primitives and utilities for building voice-based applications and
-  hardware devices, such as the `B333rnphone`b program, that can be used to build hardware telephones.
+• The `_`!`[LXST`a8d24177d946de4f1f0a0fe1af9a1338:/page/repo.mu`g=reticulum|r=lxst]`!`_ protocol and framework provides real-time audio and signals transport over Reticulum. It
+  includes primitives and utilities for building voice-based applications and hardware devices,
+  such as the `B333rnphone`b program, that can be used to build hardware telephones.
 
-• For an off-grid, encrypted and resilient mesh communications platform, see [Nomad Network](https://github.com/markqvist/NomadNet)
+• For an off-grid, encrypted and resilient mesh communications platform, see `_`!`[Nomad Network`a8d24177d946de4f1f0a0fe1af9a1338:/page/repo.mu`g=reticulum|r=nomadnet]`!`_.
 
-• The Android, Linux, macOS and Windows app [Sideband](https://github.com/markqvist/Sideband) has a graphical
-  interface and many advanced features, such as file transfers, image and voice messages, real-time voice calls,
-  a distributed telemetry system, mapping capabilities and full plugin extensibility.
+• The Android, Linux, macOS and Windows app `_`!`[Sideband`a8d24177d946de4f1f0a0fe1af9a1338:/page/repo.mu`g=reticulum|r=sideband]`!`_ has a graphical interface and many advanced
+  features, such as file transfers, image and voice messages, real-time voice calls, a distributed
+  telemetry system, mapping capabilities and full plugin extensibility.
 
-• [MeshChatX](https://git.quad4.io/RNS-Things/MeshChatX) is a full-featured LXMF client with many built-in tools
-  and functionalities, that also supports image and voice messages, file transfers and voice calls. It also
-  includes a built-in page browser for browsing Nomad Network nodes.
+• `_`!`[MeshChatX`c10d80b1a42fa958c37a6cc30dc04f53]`!`_ (`_`!`[source`5399f5a0212477618821e91e88ce053b:/page/repo.mu`g=quad4|r=MeshChatX]`_`!) is a full-featured LXMF client with many built-in tools and functionalities,
+  that also supports image and voice messages, file transfers and voice calls. It also includes a
+  built-in page browser for browsing Nomad Network nodes.
 
-• You can use the included [rnsh](https://reticulum.network/manual/using.html#the-rnsh-utility) program to
-  establish remote shell sessions over Reticulum.
+• You can use the included `_`!`[rnsh`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/using.md|anchor=the-rnsh-utility]`!`_ program to establish remote shell sessions over Reticulum.
 
 >> Where can Reticulum be used?
 
 Over practically any medium that can support at least a half-duplex channel with greater throughput than 5 bits per second, and an MTU of 500 bytes. Data radios, modems, LoRa radios, serial lines, AX.25 TNCs, amateur radio digital modes, WiFi and Ethernet devices, free-space optical links, and similar systems are all examples of the types of physical devices Reticulum can use.
 
-An open-source LoRa-based interface called [RNode](https://markqvist.github.io/Reticulum/manual/hardware.html#rnode) has been designed specifically for use with Reticulum. It is possible to build yourself, or it can be purchased as a complete transceiver that just needs a USB connection to the host.
+An open-source LoRa-based interface called `_`!`[RNode`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/hardware.md|anchor=rnode]`!`_ has been designed specifically for use with Reticulum. It is possible to build yourself, or it can be purchased as a complete transceiver that just needs a USB connection to the host.
 
 Reticulum can also be encapsulated over existing IP networks, so there's nothing stopping you from using it over wired Ethernet, your local WiFi network or the Internet, where it'll work just as well. In fact, one of the strengths of Reticulum is how easily it allows you to connect different mediums into a self-configuring, resilient and encrypted mesh, using any available mixture of available infrastructure.
 
@@ -100,9 +104,9 @@ As an example, it's possible to set up a Raspberry Pi connected to both a LoRa r
 
 >> How do I get started?
 
-The best way to get started with the Reticulum Network Stack depends on what you want to do. For full details and examples, have a look at the  [Getting Started Fast](https://markqvist.github.io/Reticulum/manual/gettingstartedfast.html)  section of the [Reticulum Manual](https://markqvist.github.io/Reticulum/manual/).
+The best way to get started with the Reticulum Network Stack depends on what you want to do. For full details and examples, have a look at the `_`!`[Getting Started Fast`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/gettingstartedfast.md]`!`_ section of the `_`!`[Reticulum Manual`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/index.md]`!`_.
 
-To simply install Reticulum and related utilities on your system, the easiest way is via `B333pip`b. You can then start any program that uses Reticulum, or start Reticulum as a system service with [the rnsd utility](https://markqvist.github.io/Reticulum/manual/using.html#the-rnsd-utility).
+To simply install Reticulum and related utilities on your system, the easiest way is via `B333pip`b. You can then start any program that uses Reticulum, or start Reticulum as a system service with `_`!`[the rnsd utility`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/using.md|anchor=the-rnsd-utility]`!`_.
 
 `B333
 `=
@@ -131,10 +135,11 @@ When first started, Reticulum will create a default configuration file, providin
 
 If you have an old version of `B333pip`b on your system, you may need to upgrade it first with `B333pip install pip --upgrade`b. If you no not already have `B333pip`b installed, you can install it using the package manager of your system with `B333sudo apt install python3-pip`b or similar.
 
-For more detailed examples on how to expand communication over many mediums such as packet radio or LoRa, serial ports, or over fast IP links and the Internet using the UDP and TCP interfaces, take a look at the [Supported Interfaces](https://markqvist.github.io/Reticulum/manual/interfaces.html) section of the [Reticulum Manual](https://markqvist.github.io/Reticulum/manual/).
+For more detailed examples on how to expand communication over many mediums such as packet radio or LoRa, serial ports, or over fast IP links and the Internet using the UDP and TCP interfaces, take a look at the `_`!`[Supported Interfaces`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/interfaces.md]`!`_ section of the `_`!`[Reticulum Manual`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/index.md]`!`_.
 
 >> Included Utilities
-Reticulum includes a range of useful utilities for managing your networks, viewing status and information, and other tasks. You can read more about these programs in the [Included Utility Programs](https://markqvist.github.io/Reticulum/manual/using.html#included-utility-programs) section of the [Reticulum Manual](https://markqvist.github.io/Reticulum/manual/).
+
+Reticulum includes a range of useful utilities for managing your networks, viewing status and information, and other tasks. You can read more about these programs in the `_`!`[Included Utility Programs`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/using.md|anchor=included-utility-programs]`!`_ section of the `_`!`[Reticulum Manual`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/index.md]`!`_.
 
 • The system daemon `B333rnsd`b for running Reticulum as an always-available service
 • An interface status utility called `B333rnstatus`b, that displays information about interfaces
@@ -147,16 +152,14 @@ Reticulum includes a range of useful utilities for managing your networks, viewi
 • The `B333rngit`b program provides a full multi-repository Git node for serving repositories over Reticulum
 • The included `B333git-remote-rns`b helper allows you to interact with Git repositories over Reticulum
 
-All tools, including `B333rnx`b and `B333rncp`b, work reliably and well even over very low-bandwidth links like LoRa or Packet Radio. For full-featured remote shells over Reticulum, also have a look at the [rnsh](https://github.com/acehoss/rnsh) program.
-
 >> Supported interface types and devices
 
-Reticulum implements a range of generalised interface types that covers most of the communications hardware that Reticulum can run over. If your hardware is not supported, it's [simple to implement a custom interface module](https://markqvist.github.io/Reticulum/manual/interfaces.html#custom-interfaces).
+Reticulum implements a range of generalised interface types that covers most of the communications hardware that Reticulum can run over. If your hardware is not supported, it's `_`!`[simple to implement a custom interface module`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/interfaces.md|anchor=custom-interfaces]`!`_.
 
 Currently, the following built-in interfaces are supported:
 
 • Any Ethernet device
-• LoRa using [RNode](https://unsigned.io/rnode/)
+• LoRa using `_`!`[RNode`a8d24177d946de4f1f0a0fe1af9a1338:/page/repo.mu`g=reticulum|r=rnode_firmware]`!`_
 • Packet Radio TNCs (with or without AX.25)
 • KISS-compatible hardware and software modems
 • Any device with a serial port
@@ -166,64 +169,72 @@ Currently, the following built-in interfaces are supported:
 • Custom hardware via stdio or pipes
 
 >> Performance
-Reticulum targets a *very* wide usable performance envelope, but prioritises functionality and performance on low-bandwidth mediums. The goal is to provide a dynamic performance envelope from 250 bits per second, to 1 gigabit per second on normal hardware.
+
+Reticulum targets a `*very`* wide usable performance envelope, but prioritises functionality and performance on low-bandwidth mediums. The goal is to provide a dynamic performance envelope from 250 bits per second, to 1 gigabit per second on normal hardware.
 
 Currently, the usable performance envelope is approximately 150 bits per second to 500 megabits per second, with physical mediums faster than that not being saturated. Performance beyond the current level is intended for future upgrades, but not highly prioritised at this point in time.
 
 >> Current Status
+
 All core protocol features are implemented and functioning, but additions will probably occur as real-world use is explored and understood. The API and wire-format can be considered stable.
 
 >> Dependencies
+
 The installation of the default `B333rns`b package requires only two external dependencies, listed below. Almost all systems and distributions have readily available packages for these dependencies, and when the `B333rns`b package is installed with `B333pip`b, they will be downloaded and installed as well.
 
-• [PyCA/cryptography](https://github.com/pyca/cryptography)
-• [pyserial](https://github.com/pyserial/pyserial)
+• PyCA/cryptography
+• pyserial
 
-On more unusual systems, and in some rare cases, it might not be possible to install or even compile one or more of the above modules. In such situations, you can use the `B333rnspure`b package instead, which require no external dependencies for installation. Please note that the contents of the `B333rns`b and `B333rnspure`b packages are *identical*. The only difference is that the `B333rnspure`b package lists no dependencies required for installation.
+On more unusual systems, and in some rare cases, it might not be possible to install or even compile one or more of the above modules. In such situations, you can use the `B333rnspure`b package instead, which require no external dependencies for installation. Please note that the contents of the `B333rns`b and `B333rnspure`b packages are `*identical`*. The only difference is that the `B333rnspure`b package lists no dependencies required for installation.
 
-No matter how Reticulum is installed and started, it will load external dependencies only if they are *needed* and *available*. If for example you want to use Reticulum on a system that cannot support [pyserial](https://github.com/pyserial/pyserial), it is perfectly possible to do so using the `B333rnspure`b package, but Reticulum will not be able to use serial-based interfaces. All other available modules will still be loaded when needed.
+No matter how Reticulum is installed and started, it will load external dependencies only if they are `*needed`* and `*available`*. If for example you want to use Reticulum on a system that cannot support `B333pyserial`b, it is perfectly possible to do so using the `B333rnspure`b package, but Reticulum will not be able to use serial-based interfaces. All other available modules will still be loaded when needed.
 
-**Please Note!** If you use the `B333rnspure`b package to run Reticulum on systems that do not support [PyCA/cryptography](https://github.com/pyca/cryptography), it is important that you read and understand the [Cryptographic Primitives](#cryptographic-primitives) section of this document.
+`!Please Note!`! If you use the `B333rnspure`b package to run Reticulum on systems that do not support PyCA/cryptography, it is important that you read and understand the `!Cryptographic Primitives`! section of this document.
 
 >> Bootstrapping Connectivity
 
 Reticulum is not a service you subscribe to, nor is it a single global network you "join". Reticulum provides functionality for discovering available public interfaces over the network itself, and the broader community has provided various directories of publicly available entrypoints to bootstrap connectivity.
 
-To learn how to establish initial connectivity over Reticulum, read the [Bootstrapping Connectivity](https://reticulum.network/manual/gettingstartedfast.html#bootstrapping-connectivity) section of the manual.
+To learn how to establish initial connectivity over Reticulum, read the `_`!`[Bootstrapping Connectivity`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/gettingstartedfast.md|anchor=bootstrapping-connectivity]`!`_ section of the manual.
 
-If you already have a general idea of how this works, you can use community-run sites such as [directory.rns.recipes](https://directory.rns.recipes/) and [rmap.world](https://rmap.world) to find interface definitions for initial connectivity to the global distributed Reticulum backbone.
+If you already have a general idea of how this works, you can use community-run sites such as `_`!`[rns.recipes`9ce92808be498e9e05590ff27cbfdfe4]`!`_ and `_`!`[rmap.world`a4a5e861626ce97c9aa544d9ecdf6d22]`!`_ to find interface definitions for initial connectivity to the global distributed Reticulum backbone.
 
 >> Public Testnet
-***Important!** Historically, a developer-targeted testnet was made available by the Reticulum project itself. As the amount of global Reticulum nodes and entrypoints have grown to a substantial quantity, this public testnet, including the Amsterdam Testnet entrypoint, has now been decommissioned. If your still have instances that relied on this entrypoint for connectivity, transition to using the distributed backbone instead. Reticulum now includes a full on-network interface discovery and connectivity bootstrapping system. Read the [Bootstrapping Connectivity](https://reticulum.network/manual/gettingstartedfast.html#bootstrapping-connectivity) section of the manual for pointers.*
+
+`!`*Important!`! Historically, a developer-targeted testnet was made available by the Reticulum project itself. As the amount of global Reticulum nodes and entrypoints have grown to a substantial quantity, this public testnet, including the Amsterdam Testnet entrypoint, has now been decommissioned. If you still have instances that relied on this entrypoint for connectivity, transition to using the distributed backbone instead. Reticulum now includes a full on-network interface discovery and connectivity bootstrapping system. Read the `_`[Bootstrapping Connectivity`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=docs/markdown/gettingstartedfast.md|anchor=bootstrapping-connectivity]`_ section of the manual for pointers.`*
 
 >> Support Reticulum
+
 For this to be possible, I need your help. Please support the continued development of open, free and private communications systems by donating via one of the following channels:
 
-• Monero:
+• `!Monero`!
   84FpY1QbxHcgdseePYNmhTHcrgMX4nFfBYtz2GKYToqHVVhJp8Eaw1Z1EedRnKD19b3B8NiLCGVxzKV17UMmmeEsCrPyA5w
 
-• Bitcoin
+• `!Bitcoin`!
   bc1pgqgu8h8xvj4jtafslq396v7ju7hkgymyrzyqft4llfslz5vp99psqfk3a6
 
-• Ethereum
+• `!Ethereum`!
   0x91C421DdfB8a30a49A71d63447ddb54cEBe3465E
 
-• Liberapay: https://liberapay.com/Reticulum/
+• `!Liberapay`!
+  `[https://liberapay.com/Reticulum/]
 
-• Ko-Fi: https://ko-fi.com/markqvist
+• `!Ko-Fi`!
+  `[https://ko-fi.com/markqvist]
 
 >> Cryptographic Primitives
+
 Reticulum uses a simple suite of efficient, strong and well-tested cryptographic primitives, with widely available implementations that can be used both on general-purpose CPUs and on microcontrollers.
 
-One of the primary considerations for choosing this particular set of primitives is that they can be implemented *safely* with relatively few pitfalls, on practically all current computing platforms.
+One of the primary considerations for choosing this particular set of primitives is that they can be implemented `*safely`* with relatively few pitfalls, on practically all current computing platforms.
 
-The primitives listed here **are authoritative**. Anything claiming to be Reticulum, but not using these exact primitives **is not** Reticulum, and possibly an intentionally compromised or weakened clone. The utilised primitives are:
+The primitives listed here `!are authoritative`!. Anything `*claiming`* to be Reticulum, but not using these exact primitives `FTA35050`!is not`!`f Reticulum, and possibly an intentionally compromised or weakened clone. The utilised primitives are:
 
 • Reticulum Identity Keys are 512-bit Curve25519 keysets
   • A 256-bit Ed25519 key for signatures
   • A 256-bit X22519 key for ECDH key exchanges
 • HKDF for key derivation
-• Encrypted tokens are based on the [Fernet spec](https://github.com/fernet/spec/)
+• Encrypted tokens are based on the `_`!`[Fernet spec`https://github.com/fernet/spec/]`!`_
   • Ephemeral keys derived from an ECDH key exchange on Curve25519
   • HMAC using SHA256 for message authentication
   • IVs must be generated through `B333os.urandom()`b or better
@@ -232,36 +243,37 @@ The primitives listed here **are authoritative**. Anything claiming to be Reticu
 • SHA-256
 • SHA-512
 
-In the default installation configuration, the `B333X25519`b, `B333Ed25519`b, and `B333AES-256-CBC`b primitives are provided by [OpenSSL](https://www.openssl.org/) (via the [PyCA/cryptography](https://github.com/pyca/cryptography) package). The hashing functions `B333SHA-256`b and `B333SHA-512`b are provided by the standard Python [hashlib](https://docs.python.org/3/library/hashlib.html). The `B333HKDF`b, `B333HMAC`b, `B333Token`b primitives, and the `B333PKCS7`b padding function are always provided by the following internal implementations:
+In the default installation configuration, the `B333X25519`b, `B333Ed25519`b, and `B333AES-256-CBC`b primitives are provided by `_`!`[OpenSSL`https://www.openssl.org/]`!`_ (via the `_`!`[PyCA/cryptography`https://github.com/pyca/cryptography]`!`_ package). The hashing functions `B333SHA-256`b and `B333SHA-512`b are provided by the standard Python `_`!`[hashlib`https://docs.python.org/3/library/hashlib.html]`!`_. The `B333HKDF`b, `B333HMAC`b, `B333Token`b primitives, and the `B333PKCS7`b padding function are always provided by the following internal implementations:
 
-• [HKDF.py](RNS/Cryptography/HKDF.py)
-• [HMAC.py](RNS/Cryptography/HMAC.py)
-• [Token.py](RNS/Cryptography/Token.py)
-• [PKCS7.py](RNS/Cryptography/PKCS7.py)
+• `_`!`[HKDF.py`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=RNS/Cryptography/HKDF.py]`!`_
+• `_`!`[HMAC.py`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=RNS/Cryptography/HMAC.py]`!`_
+• `_`!`[Token.py`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=RNS/Cryptography/Token.py]`!`_
+• `_`!`[PKCS7.py`:/page/blob.mu`g=reticulum|r=reticulum|ref=HEAD|path=RNS/Cryptography/PKCS7.py]`!`_
 
-Reticulum also includes a complete implementation of all necessary primitives in pure Python. If OpenSSL and PyCA are not available on the system when Reticulum is started, Reticulum will instead use the internal pure-python primitives. A trivial consequence of this is performance, with the OpenSSL backend being *much* faster. The most important consequence however, is the potential loss of security by using primitives that has not seen the same amount of scrutiny, testing and review as those from OpenSSL.
+Reticulum also includes a complete implementation of all necessary primitives in pure Python. If OpenSSL and PyCA are not available on the system when Reticulum is started, Reticulum will instead use the internal pure-python primitives. A trivial consequence of this is performance, with the OpenSSL backend being `*much`* faster. The most important consequence however, is the potential loss of security by using primitives that has not seen the same amount of scrutiny, testing and review as those from OpenSSL.
 
-Please note that by default, installing Reticulum will **require** OpenSSL and PyCA to also be automatically installed if not already available. It is only possible to use the pure-python primitives if this requirement is specifically overridden by the user, for example by installing the `B333rnspure`b package instead of the normal `B333rns`b package, or by running directly from local source-code.
+Please note that by default, installing Reticulum will `!require`! OpenSSL and PyCA to also be automatically installed if not already available. It is only possible to use the pure-python primitives if this requirement is specifically overridden by the user, for example by installing the `B333rnspure`b package instead of the normal `B333rns`b package, or by running directly from local source-code.
 
-If you want to use the internal pure-python primitives, it is **highly advisable** that you have a good understanding of the risks that this pose, and make an informed decision on whether those risks are acceptable to you.
+If you want to use the internal pure-python primitives, it is `!highly advisable`! that you have a good understanding of the risks that this pose, and make an informed decision on whether those risks are acceptable to you.
 
 Reticulum is relatively young software, and should be considered as such. While it has been built with cryptography best-practices very foremost in mind, it _has not_ been externally security audited, and there could very well be privacy or security breaking bugs. If you want to help out, or help sponsor an audit, please do get in touch.
 
 >> Acknowledgements & Credits
+
 Reticulum can only exist because of the mountain of Open Source work it was built on top of, the contributions of everyone involved, and everyone that has supported the project through the years. To everyone who has helped, thank you so much.
 
 A number of other modules and projects are either part of, or used by Reticulum. Sincere thanks to the authors and contributors of the following projects:
 
-• [PyCA/cryptography](https://github.com/pyca/cryptography), *BSD License*
-• [Pure-25519](https://github.com/warner/python-pure25519) by [Brian Warner](https://github.com/warner), *MIT License*
-• [Pysha2](https://github.com/thomdixon/pysha2) by [Thom Dixon](https://github.com/thomdixon), *MIT License*
-• [Python AES-128](https://github.com/orgurar/python-aes) by [Or Gur Arie](https://github.com/orgurar), *MIT License*
-• [Python AES-256](https://github.com/boppreh/aes) by [BoppreH](https://github.com/boppreh), *MIT License*
-• [Curve25519.py](https://gist.github.com/nickovs/cc3c22d15f239a2640c185035c06f8a3#file-curve25519-py) by [Nicko van Someren](https://gist.github.com/nickovs), *Public Domain*
-• [I2Plib](https://github.com/l-n-s/i2plib) by [Viktor Villainov](https://github.com/l-n-s)
-• [PySerial](https://github.com/pyserial/pyserial) by Chris Liechti, *BSD License*
-• [Configobj](https://github.com/DiffSK/configobj) by Michael Foord, Nicola Larosa, Rob Dennis & Eli Courtwright, *BSD License*
-• [ifaddr](https://github.com/pydron/ifaddr) by Stefan C. Mueller, *MIT License*
-• [Umsgpack.py](https://github.com/vsergeev/u-msgpack-python) by [Ivan A. Sergeev](https://github.com/vsergeev)
-• [rnsh](https://github.com/acehoss/rnsh) by [Aaron Heise](https://github.com/acehoss)
-• [Python](https://www.python.org)
+• `_`!`[PyCA/cryptography`https://github.com/pyca/cryptography]`!`_, `*BSD License`*
+• `_`!`[Pure-25519`https://github.com/warner/python-pure25519]`!`_, by `_`!`[Brian Warner`https://github.com/warner]`!`_, `*MIT License`*
+• `_`!`[Pysha2`https://github.com/thomdixon/pysha2]`!`_ by `_`!`[Thom Dixon`https://github.com/thomdixon]`!`_, `*MIT License`*
+• `_`!`[Python AES-128`https://github.com/orgurar/python-aes]`!`_ by `_`!`[Or Gur Arie`https://github.com/orgurar]`!`_, `*MIT License`*
+• `_`!`[Python AES-256`https://github.com/boppreh/aes]`!`_ by `_`!`[BoppreH`https://github.com/boppreh]`!`_, `*MIT License`*
+• `_`!`[Curve25519.py`https://gist.github.com/nickovs/cc3c22d15f239a2640c185035c06f8a3]`!`_ by `_`!`[Nicko van Someren`https://gist.github.com/nickovs]`!`_, `*Public Domain`*
+• `_`!`[I2Plib`https://github.com/l-n-s/i2plib]`!`_ by `_`!`[Viktor Villainov`https://github.com/l-n-s]`!`_
+• `_`!`[PySerial`https://github.com/pyserial/pyserial]`!`_ by Chris Liechti, `*BSD License`*
+• `_`!`[Configobj`https://github.com/DiffSK/configobj]`!`_ by Michael Foord, Nicola Larosa, Rob Dennis & Eli Courtwright, `*BSD License`*
+• `_`!`[ifaddr`https://github.com/pydron/ifaddr]`!`_ by Stefan C. Mueller, `*MIT License`*
+• `_`!`[Umsgpack.py`https://github.com/vsergeev/u-msgpack-python]`!`_ by `_`!`[Ivan A. Sergeev`https://github.com/vsergeev]`!`_
+• `_`!`[rnsh`https://github.com/acehoss/rnsh]`!`_ by `_`!`[Aaron Heise`https://github.com/acehoss]`!`_
+• `_`!`[Python`https://www.python.org]`!`_

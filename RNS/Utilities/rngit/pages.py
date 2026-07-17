@@ -34,6 +34,8 @@ import threading
 import subprocess
 import urllib.parse
 import RNS
+import struct
+import base64
 from collections import deque
 from datetime import datetime
 from RNS.Utilities.rngit import APP_NAME
@@ -42,6 +44,8 @@ from RNS.Utilities.rngit.highlight import SyntaxHighlighter
 from RNS.vendor.configobj import ConfigObj
 from RNS.vendor import umsgpack as mp
 from RNS._version import __version__
+from RNS.Utilities.rnid import validate_rsg, extract_signed_rsg_data
+from RNS.Utilities.rngit.commitsigs import unarmor_ssh_signature, parse_ssh_signature, extract_commit_author
 
 class NomadNetworkNode():
     APP_NAME              = "nomadnetwork"
@@ -60,8 +64,9 @@ class NomadNetworkNode():
     PATH_RELEASE          = "/page/release.mu"
     PATH_WORK             = "/page/work.mu"
     PATH_WORK_DOC         = "/page/work_doc.mu"
-    PATH_ARTIFACT         = "/file/artifact"
-    PATH_DOWNLOAD         = "/file/download"
+    FILE_ARTIFACT         = "/file/artifact"
+    FILE_DOWNLOAD         = "/file/download"
+    FILE_WORKDOC          = "/file/workdoc"
 
     BLOB_SIZE_LIMIT       = 256 * 1024
     TREE_ENTRIES_PER_PAGE = 1000
@@ -97,6 +102,19 @@ class NomadNetworkNode():
     CLR_FILE        = "`F66d"
     CLR_DIM         = "`F666"
     CLR_DIM_H       = "`F444"
+    CLR_OK_DIM      = "`FT537855"
+    CLR_DIFF_A      = "`F0a0"
+    CLR_DIFF_R      = "`F900"
+    CLR_DIFF_P      = "`F0aa"
+
+    RCLR_PUSH       = "B9A810"
+    RCLR_PUSH_G     = "791212"
+    RCLR_FETCH      = "10b981"
+    RCLR_FETCH_G    = "1c5e71"
+    RCLR_VIEW       = "3b82f6"
+    RCLR_VIEW_G     = "13428A"
+    RCLR_DOWNLOAD   = "7831E0"
+    RCLR_DOWNLOAD_G = "c5754d"
 
     # Yes, I'm being intentionally weird here. If you
     # want to use tabs, three spaces is all you get.
@@ -207,6 +225,13 @@ class NomadNetworkNode():
         if not remote_identity: remote_identity = self.null_ident
         return self.owner.resolve_permission(remote_identity, group_name, repository_name, permission)
 
+    def resolve_doc_permission(self, remote_identity, group_name, repository_name, doc_id, permission):
+        # Since the nomadnet page protocol doesn't *require* authentication,
+        # we use null_ident in case the remote hasn't identified.
+        if not remote_identity: remote_identity = self.null_ident
+
+        return self.owner.resolve_doc_permission(remote_identity, group_name, repository_name, doc_id, permission)
+
     def register_request_handlers(self):
         self.destination.register_request_handler(self.PATH_INDEX,    response_generator=self.serve_front_page,    allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.PATH_GROUP,    response_generator=self.serve_group_page,    allow=RNS.Destination.ALLOW_ALL)
@@ -221,8 +246,9 @@ class NomadNetworkNode():
         self.destination.register_request_handler(self.PATH_RELEASE,  response_generator=self.serve_release_page,  allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.PATH_WORK,     response_generator=self.serve_work_page,     allow=RNS.Destination.ALLOW_ALL)
         self.destination.register_request_handler(self.PATH_WORK_DOC, response_generator=self.serve_work_doc_page, allow=RNS.Destination.ALLOW_ALL)
-        self.destination.register_request_handler(self.PATH_ARTIFACT, response_generator=self.serve_artifact,      allow=RNS.Destination.ALLOW_ALL)
-        self.destination.register_request_handler(self.PATH_DOWNLOAD, response_generator=self.serve_download,      allow=RNS.Destination.ALLOW_ALL)
+        self.destination.register_request_handler(self.FILE_ARTIFACT, response_generator=self.serve_artifact,      allow=RNS.Destination.ALLOW_ALL)
+        self.destination.register_request_handler(self.FILE_DOWNLOAD, response_generator=self.serve_download,      allow=RNS.Destination.ALLOW_ALL)
+        self.destination.register_request_handler(self.FILE_WORKDOC,  response_generator=self.serve_wd_download,   allow=RNS.Destination.ALLOW_ALL)
 
     def get_template(self, template):
         filename = f"{template}.mu"
@@ -292,6 +318,16 @@ class NomadNetworkNode():
             field_str = "`" + "|".join(field_parts)
         return f"`[{sanitize_label(_label)}`:{_path}{field_str}]"
 
+    def m_link_e(self, _label, remote, _path, **fields):
+        def sanitize_v(value): return urllib.parse.quote_plus(str(value).encode("utf-8"))
+        def sanitize_label(value): return value.replace("[", "").replace("]", "").replace("`", "")
+        field_str = ""
+        if fields:
+            field_parts = []
+            for k, v in fields.items(): field_parts.append(f"{k}={sanitize_v(v)}")
+            field_str = "`" + "|".join(field_parts)
+        return f"`!`[{sanitize_label(_label)}`{remote}:{_path}{field_str}]`!"
+
     def m_link(self, _label, _path, **fields):
         def sanitize_v(value): return urllib.parse.quote_plus(str(value).encode("utf-8"))
         def sanitize_label(value): return value.replace("[", "").replace("]", "").replace("`", "")
@@ -342,7 +378,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Group page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
 
         if not group_name:
@@ -385,7 +421,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Repository page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name = data.get("var_r", "") if data else ""
         ref = data.get("var_ref", "HEAD") if data else "HEAD"
@@ -408,7 +444,35 @@ class NomadNetworkNode():
         if not repo:
             content = self.m_heading("Not Found", 1) + "\nThe requested repository was not found.\n"
             return self.render_template(content, nav_content="".join(nav_parts), st=st)
-        
+
+        repo_source = ""; source_link = None
+        if repo["fork"] or repo["mirror"]:
+            if   repo["fork"]:   source_type = "fork"; source_url = repo["fork"]
+            elif repo["mirror"]: source_type = "mirror"; source_url = repo["mirror"]
+            else:                source_type = "retriev"; source_url = "unknown source"
+            if not source_url.lower().startswith("rns://"): source_link = ""
+            else:
+                try:
+                    url_components = source_url.split("/")
+                    if len(url_components) == 5 and len(url_components[2]) == RNS.Identity.TRUNCATED_HASHLENGTH//8*2:
+                        source_repo_dest  = bytes.fromhex(url_components[2])
+                        source_group_name = url_components[3]
+                        source_repo_name  = url_components[4]
+                        source_identity   = RNS.Identity.recall(source_repo_dest)
+                        if source_identity:
+                            source_page_dest = RNS.Destination.hash_from_name_and_identity("nomadnetwork.node", source_identity)
+                            mu_link = self.m_link_e(source_url, RNS.hexrep(source_page_dest, delimit=False), self.PATH_REPO, g=source_group_name, r=source_repo_name)
+                            source_link = f"{mu_link}"
+                except Exception as e: source_link = ""
+
+            synced_ago    = max(0, time.time()-self.owner.last_upstream_sync(repo["path"]))
+            sync_time     = RNS.prettytime(synced_ago, compact=True).split(" ")[0]
+            sync_str      = f" `*{self.CLR_DIM_H}synced {sync_time} ago`f`*\n"
+            source_desc   = f"{source_type}ed from"
+            source_indent = " "*(len(f"Node / {group_name} / {repo_name}")-len(source_desc))
+            if source_link: source_url = source_link
+            nav_parts.append(f"{self.CLR_DIM}{source_desc.capitalize()}{source_indent} {source_url}`f{sync_str}\n")
+
         description = self.get_repository_description(repo["path"])
         if description: description = f"{description}\n\n"
         else:           description = ""
@@ -432,7 +496,7 @@ class NomadNetworkNode():
         # Get releases count
         releases_path = f"{repo['path']}.releases"
         releases_count = 0
-        releases = self.owner.releases_list_data(releases_path)
+        releases, latest_release = self.owner.releases_list_data(releases_path)
         if releases: releases_count = len([r for r in releases if r.get("status") == "published"])
 
         sep = self.icon("sep")
@@ -454,20 +518,18 @@ class NomadNetworkNode():
                 content_parts.append(self.m_divider())
             
             if readme_is_markdown:
-                converted = self.mdc.format_block(readme_content)
+                url_scope = f":/page/blob.mu`g={group_name}|r={repo_name}|ref={ref}|path="
+                mdc = MarkdownToMicron(max_width=self.MAX_RENDER_WIDTH, syntax_highlighter=self.highlighter, url_scope=url_scope)
+                converted = mdc.format_block(readme_content)
                 content_parts.append(converted)
             
-            else: content_parts.append(f"\n{readme_content}\n")
-            
-            content_parts.append("\n")
-            content_parts.append(self.m_divider())
+            else: content_parts.append(f"\n{readme_content.rstrip()}\n")
         
         else:
             content_parts.append(self.m_divider())
             content_parts.append("\n")
             content_parts.append(self.m_italic("No README file found in this repository."))
-
-        content_parts.append("\n")
+            content_parts.append("\n")
 
         self.owner.view_succeeded(group_name, repo_name, remote_identity)
         page_content = "".join(content_parts)
@@ -478,7 +540,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Tree page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "")   if data else ""
         repo_name = data.get("var_r", "")    if data else ""
         ref = data.get("var_ref", "HEAD")    if data else "HEAD"
@@ -647,6 +709,7 @@ class NomadNetworkNode():
             content = self.m_heading("Invalid Path", 1) + "\n\nNo file path specified.\n"
             return self.render_template(content, st=st)
 
+        file_path = file_path.lstrip("./").replace("/./", "/")
         file_ext = os.path.splitext(file_path)[1].lower()
         renderable = file_ext in self.RENDERABLE_EXTS
         if not renderable: raw = True; render = False
@@ -675,7 +738,7 @@ class NomadNetworkNode():
         nav_parts.append(">>\n" + breadcrumb + "\n")
         sep = self.icon("sep")
 
-        dl_link  = self.m_link("Download", self.PATH_DOWNLOAD, g=group_name, r=repo_name, ref=ref, path=file_path)
+        dl_link  = self.m_link("Download", self.FILE_DOWNLOAD, g=group_name, r=repo_name, ref=ref, path=file_path)
         if not renderable: nav_parts.append(f"\nDisplaying Raw {sep} {dl_link}\n")
         else:
             rnd_link = self.m_link("View rendered", self.PATH_BLOB, g=group_name, r=repo_name, ref=ref, path=file_path, render="y")
@@ -689,6 +752,10 @@ class NomadNetworkNode():
 
         if blob_info is None: content_parts.append("File not found at this ref.\n")
         else:
+            # Redirect to tree page if this is a tree
+            if blob_info.get("is_tree", None) == True:
+                return self.serve_tree_page(path, data, request_id, link_id, remote_identity, requested_at)
+
             size = blob_info.get("size", 0)
             is_binary = blob_info.get("is_binary", False)
             is_symlink = blob_info.get("is_symlink", False)
@@ -742,7 +809,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Commits page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "")   if data else ""
         repo_name = data.get("var_r", "")    if data else ""
         ref = data.get("var_ref", "HEAD")    if data else "HEAD"
@@ -801,7 +868,7 @@ class NomadNetworkNode():
                 author = commit["author"]
                 date = self.format_absolute_time(commit["timestamp"])+" - "+self.format_relative_time(commit["timestamp"])
 
-                hash_link = self.m_link(short_hash, self.PATH_COMMIT, g=group_name, r=repo_name, h=commit["hash"])
+                hash_link = self.m_link(short_hash, self.PATH_COMMIT, g=group_name, r=repo_name, ref=ref, h=commit["hash"])
 
                 content_parts.append(f"`F66d{hash_link}`f {self.m_escape(author)} {self.CLR_DIM}{date}`f\n")
                 content_parts.append(f"{self.m_escape(subject)}\n\n")
@@ -825,9 +892,10 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Commit page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "")  if data else ""
         repo_name = data.get("var_r", "")   if data else ""
+        ref = data.get("var_ref", "HEAD")    if data else "HEAD"
         commit_hash = data.get("var_h", "") if data else ""
 
         if not group_name or not repo_name:
@@ -840,6 +908,12 @@ class NomadNetworkNode():
             return self.render_template(content, st=st)
 
         repo_path = repo["path"]
+
+        # Validate ref exists
+        resolved_ref = self.resolve_ref(repo_path, ref)
+        if not resolved_ref:
+            content = self.m_heading("Ref Not Found", 1) + f"\n\nThe ref '{ref}' does not exist in this repository.\n"
+            return self.render_template(content, st=st)
 
         # Validate commit hash
         if not commit_hash or len(commit_hash) < 7:
@@ -854,7 +928,7 @@ class NomadNetworkNode():
 
         # Breadcrumb navigation
         nav_parts = []
-        breadcrumb = f"{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {self.m_link(repo_name, self.PATH_REPO, g=group_name, r=repo_name)} / {resolved_hash[:7]}"
+        breadcrumb = f"{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {self.m_link(repo_name, self.PATH_REPO, g=group_name, r=repo_name)} / {self.m_link('commits', self.PATH_COMMITS, g=group_name, r=repo_name, ref=ref)} / {resolved_hash[:7]}"
         nav_parts.append(">>\n" + breadcrumb + "\n")
         nav_content = "".join(nav_parts)
 
@@ -888,27 +962,37 @@ class NomadNetworkNode():
         i_folder = self.icon("folder")
         content_parts.append(f"{self.m_link(f'{i_folder} Browse tree at this commit', self.PATH_TREE, g=group_name, r=repo_name, ref=resolved_hash)}\n\n")
 
+        # Validate and display commit signature status
+        show_sig   =  False
+        sig_status = self.get_commit_signature(repo_path, resolved_hash)
+        if sig_status["signed"]:
+            if   sig_status["valid"] and sig_status["author_match"]: sig_text = f"`FT66BB85Valid, signed by author`f"; show_sig = True
+            elif sig_status["valid"]:                                sig_text = f"`Faa0{self.m_escape(sig_status['message'])}`f"; show_sig = True
+            else:                                                    sig_text = f"`F900{self.m_escape(sig_status['message'])}`f"; show_sig = True
+        else:                                                        sig_text = "Not signed"
+
         # Commit metadata
         if commit_info.get("parents"):
             parent_links = []
             for parent_hash in commit_info["parents"]:
-                parent_link = self.m_link(parent_hash[:7], self.PATH_COMMIT, g=group_name, r=repo_name, h=parent_hash)
+                parent_link = self.m_link(parent_hash[:7], self.PATH_COMMIT, g=group_name, r=repo_name, ref=ref, h=parent_hash)
                 parent_links.append(parent_link)
 
-            content_parts.append(f"Parents: {' '.join(parent_links)}\n")
+            content_parts.append(f"Parents    : {' '.join(parent_links)}\n")
 
-        content_parts.append(f"Author:  {self.m_escape(commit_info['author_name'])} <{self.m_escape(commit_info['author_email'])}>\n")
-        content_parts.append(f"Date:    {commit_info['author_date']}\n")
+        content_parts.append(f"Author     : {self.m_escape(commit_info['author_name'])} <{self.m_escape(commit_info['author_email'])}>\n")
+        content_parts.append(f"Signature  : {sig_text}\n") if show_sig else None
+        content_parts.append(f"Date       : {commit_info['author_date']}\n")
 
         if commit_info.get("committer_name") != commit_info.get("author_name"):
-            content_parts.append(f"Commit:  {self.m_escape(commit_info['committer_name'])} <{self.m_escape(commit_info['committer_email'])}>\n")
-            content_parts.append(f"Date:    {commit_info['committer_date']}\n")
+            content_parts.append(f"Committer : {self.m_escape(commit_info['committer_name'])} <{self.m_escape(commit_info['committer_email'])}>\n")
+            content_parts.append(f"Date      : {commit_info['committer_date']}\n")
 
         content_parts.append("\n")
 
         # Commit message
         if commit_info.get("message"):
-            content_parts.append(self.m_escape(commit_info["message"]) + "\n")
+            content_parts.append(self.format_commit(commit_info["message"]) + "\n")
             content_parts.append("\n")
 
         # Changed files
@@ -960,7 +1044,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Refs page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name = data.get("var_r", "") if data else ""
         ref_type = data.get("var_type", "") if data else ""  # "heads", "tags", or empty for both
@@ -1064,7 +1148,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Statistics page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name = data.get("var_r", "") if data else ""
 
@@ -1077,7 +1161,7 @@ class NomadNetworkNode():
         
         # Breadcrumb navigation
         repo_link = self.m_link(repo_name, self.PATH_REPO, g=group_name, r=repo_name)
-        breadcrumb = f">>\n{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {repo_link}"
+        breadcrumb = f">>\n{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {repo_link} / stats"
         nav_parts.append(breadcrumb + "\n")
 
         repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
@@ -1103,42 +1187,58 @@ class NomadNetworkNode():
         content_parts.append(self.m_heading(f"Stats for {repo_name}", 2))
 
         v_total = stats["views"]["total"]
-        v_peak = stats["views"]["peak"]
+        v_peak  = stats["views"]["peak"]
+        v_tday  = stats["views"]["daily"][-1] if len(stats["views"]["daily"]) else 0
+        
         f_total = stats["fetches"]["total"]
-        f_peak = stats["fetches"]["peak"]
-        p_total = stats["pushes"]["total"]
-        p_peak = stats["pushes"]["peak"]
+        f_peak  = stats["fetches"]["peak"]
+        f_tday  = stats["fetches"]["daily"][-1] if len(stats["fetches"]["daily"]) else 0
 
-        content_parts.append(f"\n`F66dViews`f    : {v_total:>5}  total {self.CLR_DIM}(peak: {v_peak:>3})`f\n")
-        content_parts.append(f"`F0a0Fetches`f  : {f_total:>5}  total {self.CLR_DIM}(peak: {f_peak:>3})\n`f")
-        content_parts.append(f"`Faa0Pushes`f   : {p_total:>5}  total {self.CLR_DIM}(peak: {p_peak:>3})\n`f")
-        content_parts.append(f"`F0aaActivity`f : {stats['activity_score']:>5} points\n\n")
+        p_total = stats["pushes"]["total"]
+        p_peak  = stats["pushes"]["peak"]
+        p_tday  = stats["pushes"]["daily"][-1] if len(stats["pushes"]["daily"]) else 0
+
+        d_total = stats["downloads_combined"]["total"]
+        d_peak  = stats["downloads_combined"]["peak"]
+        d_tday  = stats["downloads_combined"]["daily"][-1] if len(stats["downloads_combined"]["daily"]) else 0
+
+        content_parts.append( f"\n`FT{self.RCLR_FETCH}Fetches`f   : {f_total:>5}  total {self.CLR_DIM}  today: {f_tday:>3}  peak: {f_peak:>3} \n`f")
+        content_parts.append(    f"`FT{self.RCLR_PUSH}Pushes`f    : {p_total:>5}  total {self.CLR_DIM}  today: {p_tday:>3}  peak: {p_peak:>3} \n`f")
+        content_parts.append(    f"`FT{self.RCLR_VIEW}Views`f     : {v_total:>5}  total {self.CLR_DIM}  today: {v_tday:>3}  peak: {v_peak:>3} `f\n")
+        content_parts.append(f"`FT{self.RCLR_DOWNLOAD}Downloads`f : {d_total:>5}  total {self.CLR_DIM}  today: {d_tday:>3}  peak: {d_peak:>3} `f\n")
+        content_parts.append(                  f"`F0aaActivity`f  : {stats['activity_score']:>5} points\n\n")
         content_parts.append(f"{act_color}{act_label}`f over the last {stats['actual_days']} days ({stats['date_range']})\n\n")
-        
-        if v_total > 0:
-            content_parts.append(self.m_heading(f"Views", 2))
-            content_parts.append("\n")
-            content_parts.append(self.render_chart(stats["views"]["daily"], stats["timeline_labels"], color="66d"))
-            content_parts.append("\n")
-        
+
         if f_total > 0:
             content_parts.append(self.m_heading(f"Fetches", 2))
             content_parts.append("\n")
-            content_parts.append(self.render_chart(stats["fetches"]["daily"], stats["timeline_labels"], color="0a0"))
+            content_parts.append(self.render_chart(stats["fetches"]["daily"], stats["timeline_labels"], color=self.RCLR_FETCH, secondary_color=self.RCLR_FETCH_G))
             content_parts.append("\n")
         
         if p_total > 0:
             content_parts.append(self.m_heading(f"Pushes", 2))
             content_parts.append("\n")
-            content_parts.append(self.render_chart(stats["pushes"]["daily"], stats["timeline_labels"], color="aa0"))
+            content_parts.append(self.render_chart(stats["pushes"]["daily"], stats["timeline_labels"], color=self.RCLR_PUSH, secondary_color=self.RCLR_PUSH_G))
+            content_parts.append("\n")
+
+        if v_total > 0:
+            content_parts.append(self.m_heading(f"Views", 2))
+            content_parts.append("\n")
+            content_parts.append(self.render_chart(stats["views"]["daily"], stats["timeline_labels"], color=self.RCLR_VIEW, secondary_color=self.RCLR_VIEW_G))
+            content_parts.append("\n")
+        
+        if d_total > 0:
+            content_parts.append(self.m_heading(f"Downloads", 2))
+            content_parts.append("\n")
+            content_parts.append(self.render_chart(stats["downloads_combined"]["daily"], stats["timeline_labels"], color=self.RCLR_DOWNLOAD, secondary_color=self.RCLR_DOWNLOAD_G, gradient_factor=1.7))
             content_parts.append("\n")
 
         if stats["activity_score"] > 0:
             content_parts.append(self.m_heading("Combined Activity", 2))
             content_parts.append("\n")
-            content_parts.append(self.render_combined_chart(stats["views"]["daily"], stats["fetches"]["daily"], stats["pushes"]["daily"], stats["timeline_labels"]))
+            content_parts.append(self.render_combined_chart(stats["views"]["daily"], stats["fetches"]["daily"], stats["pushes"]["daily"], stats["downloads_combined"]["daily"], stats["timeline_labels"]))
         
-        else: content_parts.append(self.m_italic("\nNo activity recorded for this repository in the selected time period.\n\n"))
+        else: content_parts.append(self.m_italic("\nNo development activity recorded for this repository in the selected time period.\n\n"))
         
         page_content = "".join(content_parts)
         nav_content  = "".join(nav_parts)
@@ -1148,7 +1248,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Releases page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name  = data.get("var_r", "") if data else ""
 
@@ -1170,7 +1270,7 @@ class NomadNetworkNode():
         nav_content = "".join(nav_parts)
 
         releases_path = f"{repo['path']}.releases"
-        releases = self.owner.releases_list_data(releases_path)
+        releases, latest_release = self.owner.releases_list_data(releases_path)
         if not releases:
             content_parts.append(self.m_heading("Releases", 2))
             content_parts.append("\nNo releases available for this repository.\n")
@@ -1194,8 +1294,9 @@ class NomadNetworkNode():
             link = self.m_link(tag, self.PATH_RELEASE, g=group_name, r=repo_name, t=tag)
             
             sep = self.icon("sep")
+            latest_str = f" {sep} {self.CLR_OK_DIM}`*Latest`*`f" if tag == latest_release else ""
             artifacts_str = f"`*{artifacts} artifact{'s' if artifacts != 1 else ''}`*"
-            content_parts.append(f"{link} {self.CLR_DIM}{date_str} {sep} {artifacts_str}`f\n")
+            content_parts.append(f"{link} {self.CLR_DIM}{date_str} {sep} {artifacts_str}{latest_str}`f\n")
             if preview:
                 if   rel_format == "markdown": content_parts.append(f"{self.mdc.format_block(preview)}\n")
                 elif rel_format == "micron":   content_parts.append(f"{preview}\n")
@@ -1210,7 +1311,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Release page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name = data.get("var_r", "") if data else ""
         tag = data.get("var_t", "") if data else ""
@@ -1226,13 +1327,16 @@ class NomadNetworkNode():
 
         releases_path = f"{repo['path']}.releases"
         if tag == "latest":
-            releases = self.owner.releases_list_data(releases_path)
+            releases, latest_release = self.owner.releases_list_data(releases_path)
             if not releases:
-                content = self.m_heading("Release Not Found", 2) + f"\nNo latest release exist.\n"
+                content = self.m_heading("Release Not Found", 2) + f"\nNo releases exist.\n"
                 return self.render_template(content, nav_content=nav_content, st=st)
 
-            recent_releases = sorted(releases, key=lambda x: x['created'], reverse=True)
-            tag = recent_releases[0]["tag"]
+            if not latest_release:
+                recent_releases = sorted(releases, key=lambda x: x['created'], reverse=True)
+                tag = recent_releases[0]["tag"]
+
+            else: tag = latest_release
 
         content_parts = []
         nav_parts = []
@@ -1260,6 +1364,11 @@ class NomadNetworkNode():
 
         sep = self.icon("sep")
         heart = self.icon("heart")
+
+        thanks = True if data.get("var_thanks", "") else False
+        thanks_count = self.release_thanks(release_dir, add=thanks, link_id=link_id)
+        content_parts.append(f"{self.m_link_r(self.icon('heart')+f' Thanks ({thanks_count})', self.PATH_RELEASE, g=group_name, r=repo_name, t=tag, thanks='y')}\n\n")
+
         created_ts = release_info.get("created", 0)
         ts_str = f" {sep} {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(created_ts))}" if created_ts else ""
         content_parts.append(self.m_heading(f"Release {tag}{ts_str}", 2))
@@ -1279,7 +1388,7 @@ class NomadNetworkNode():
         if artifacts:
             content_parts.append(self.m_heading(f"Artifacts ({len(artifacts)})", 2))
             content_parts.append("\n")
-            for art in artifacts:
+            for art in sorted(artifacts, key=lambda e: e["name"]):
                 name = art.get("name", "unknown")
                 size = art.get("size", 0)
                 size_str = RNS.prettysize(size) if size else "0 B"
@@ -1287,18 +1396,13 @@ class NomadNetworkNode():
 
                 lstr_1 = f"{self.icon('file')} {self.m_escape(name)}"
                 lstr_2 = f"({size_str})"
-                link_1  = self.m_link_r(lstr_1, self.PATH_ARTIFACT, g=group_name, r=repo_name, t=tag, a=name)
-                link_2  = self.m_link_r(lstr_2, self.PATH_ARTIFACT, g=group_name, r=repo_name, t=tag, a=name)
+                link_1  = self.m_link_r(lstr_1, self.FILE_ARTIFACT, g=group_name, r=repo_name, t=tag, a=name)
+                link_2  = self.m_link_r(lstr_2, self.FILE_ARTIFACT, g=group_name, r=repo_name, t=tag, a=name)
                 content_parts.append(f"{link_1} {self.CLR_DIM}{link_2}`f\n")
-            content_parts.append("\n")
 
         else:
             content_parts.append(self.m_heading("Artifacts", 2))
-            content_parts.append("\nNo artifacts for this release.\n\n")
-
-        thanks = True if data.get("var_thanks", "") else False
-        thanks_count = self.release_thanks(release_dir, add=thanks, link_id=link_id)
-        content_parts.append(f"{self.m_link_r(self.icon('heart')+f' Thanks ({thanks_count})', self.PATH_RELEASE, g=group_name, r=repo_name, t=tag, thanks='y')}\n")
+            content_parts.append("\n`*No artifacts for this release`*\n")
 
         self.owner.view_succeeded(group_name, repo_name, remote_identity)
         page_content = "".join(content_parts)
@@ -1308,11 +1412,11 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Work page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name  = data.get("var_r", "") if data else ""
         scope      = data.get("var_scope", "active") if data else "active"
-        if scope not in ["active", "completed", "all"]: scope = "active"
+        if scope not in ["active", "completed", "proposed", "all"]: scope = "active"
 
         if not group_name or not repo_name:
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
@@ -1335,16 +1439,18 @@ class NomadNetworkNode():
         sep = self.icon("sep")
         active_s = "`_" if scope == "active" else ""
         cmplt_s = "`_" if scope == "completed" else ""
+        prpsd_s = "`_" if scope == "proposed" else ""
         all_s = "`_" if scope == "all" else ""
         filter_links = []
         filter_links.append(active_s+self.m_link("Active", self.PATH_WORK, g=group_name, r=repo_name, scope="active")+active_s)
         filter_links.append(cmplt_s+self.m_link("Completed", self.PATH_WORK, g=group_name, r=repo_name, scope="completed")+cmplt_s)
+        filter_links.append(prpsd_s+self.m_link("Proposed", self.PATH_WORK, g=group_name, r=repo_name, scope="proposed")+prpsd_s)
         filter_links.append(all_s+self.m_link("All", self.PATH_WORK, g=group_name, r=repo_name, scope="all")+all_s)
         content_parts.append(f" {sep} ".join(filter_links) + "\n\n")
 
         # Load work documents
         work_path = f"{repo['path']}.work"
-        scopes_to_show = ["active", "completed"] if scope == "all" else [scope]
+        scopes_to_show = ["active", "completed", "proposed"] if scope == "all" else [scope]
 
         for s in scopes_to_show:
             folder_path = os.path.join(work_path, s)
@@ -1356,6 +1462,9 @@ class NomadNetworkNode():
                     if not os.path.isdir(doc_dir): continue
                     try:
                         doc_id = int(entry)
+                        read_access = self.resolve_doc_permission(remote_identity, group_name, repo_name, doc_id, self.owner.PERM_READ)
+                        if not read_access: continue
+
                         root_path = os.path.join(doc_dir, "root")
                         if not os.path.isfile(root_path): continue
 
@@ -1402,12 +1511,12 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Work document page request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name  = data.get("var_r", "") if data else ""
         doc_id     = data.get("var_id", "") if data else ""
-        scope      = data.get("var_scope", "active") if data else "active"
-        if scope not in ["active", "completed", "all"]: scope = "active"
+        scope      = data.get("var_scope", "all") if data else "all"
+        if scope not in ["active", "completed", "proposed", "all"]: scope = "active"
 
         if not group_name or not repo_name or not doc_id:
             content = self.m_heading("Error", 2) + "\nInvalid request\n"
@@ -1423,8 +1532,31 @@ class NomadNetworkNode():
             content = self.m_heading("Error", 2) + "\nThe requested repository was not found\n"
             return self.render_template(content, st=st)
 
-        work_path = f"{repo['path']}.work"
-        doc_dir = os.path.join(work_path, scope, str(doc_id))
+        read_access = self.resolve_doc_permission(remote_identity, group_name, repo_name, doc_id, self.owner.PERM_READ)
+        if not read_access:
+            content = self.m_heading("Error", 2) + "\nThe requested work document was not found\n"
+            return self.render_template(content, st=st)
+
+        work_path     = f"{repo['path']}.work"
+        active_dir    = os.path.join(work_path, "active", str(doc_id))
+        completed_dir = os.path.join(work_path, "completed", str(doc_id))
+        proposed_dir  = os.path.join(work_path, "proposed", str(doc_id))
+        if   scope == "active":    doc_dir = active_dir
+        elif scope == "completed": doc_dir = completed_dir
+        elif scope == "proposed":  doc_dir = proposed_dir
+        elif scope == "all":
+            if os.path.isdir(active_dir):
+                doc_dir = active_dir
+                scope = "active"
+
+            elif os.path.isdir(completed_dir):
+                doc_dir = completed_dir
+                scope = "completed"
+
+            else:
+                doc_dir = proposed_dir
+                scope = "proposed"
+
         root_path = os.path.join(doc_dir, "root")
 
         if not os.path.isfile(root_path):
@@ -1440,29 +1572,45 @@ class NomadNetworkNode():
         nav_parts = []
 
         # Breadcrumb navigation
+        dl_link    = self.m_link("Download", self.FILE_WORKDOC, g=group_name, r=repo_name, id=doc_id)
         breadcrumb = f">>\n{self.m_link('Node', self.PATH_INDEX)} / {self.m_link(group_name, self.PATH_GROUP, g=group_name)} / {self.m_link(repo_name, self.PATH_REPO, g=group_name, r=repo_name)} / {self.m_link('work', self.PATH_WORK, g=group_name, r=repo_name)} / #{doc_id}"
         nav_parts.append(breadcrumb + "\n")
+        nav_parts.append(f"\n{dl_link}\n")
         nav_content = "".join(nav_parts)
 
-        doc_title = doc['meta'].get('title', 'Untitled')[:64]
+        doc_title = doc['meta'].get('title', 'Untitled')[:256]
         if len(doc_title) < len(doc['meta'].get('title', 'Untitled')): doc_title += "…"
         meta = doc.get("meta", {})
         author = meta.get("author", b"")
         author_str = RNS.prettyhexrep(author) if author else "Unknown"
+        signature = meta.get("signature", None)
+        pubkey = meta.get("identity", None)
         created = meta.get("created", 0)
         edited = meta.get("edited", 0)
         fmt = meta.get("format", "markdown")
+        content = doc.get("content", "")
+
+        signature_validated = False
+        signature_str = "Document not signed"
+        if signature and type(signature) == bytes and len(signature) == RNS.Identity.SIGLENGTH//8:
+            if pubkey and type(pubkey) == bytes and len(pubkey) == RNS.Identity.KEYSIZE//8:
+                signature_str = "Not valid"
+                identity = RNS.Identity(create_keys=False)
+                identity.load_public_key(pubkey)
+                signature_validated = identity.validate(signature, content.encode("utf-8"))
+                if signature_validated: signature_str = "Valid"
 
         # Document header
         content_parts.append(self.m_heading(f"{doc_title}", 2))
-        content_parts.append(f"\n{self.CLR_DIM}Author  : {author_str}`f\n")
-        content_parts.append(f"{self.CLR_DIM}Created : {time.strftime('%Y-%m-%d %H:%M', time.localtime(created)) if created else 'unknown'}`f\n")
+        content_parts.append(f"\n{self.CLR_DIM}Author    : {author_str}`f\n")
+        content_parts.append(f"{self.CLR_DIM}Signature : {signature_str}`f\n")
+        content_parts.append(f"{self.CLR_DIM}Created   : {time.strftime('%Y-%m-%d %H:%M', time.localtime(created)) if created else 'unknown'}`f\n")
         if edited and edited != created:
-            content_parts.append(f"{self.CLR_DIM}Edited  : {time.strftime('%Y-%m-%d %H:%M', time.localtime(edited))}`f\n")
-        content_parts.append(f"{self.CLR_DIM}Status  : {scope.capitalize()}`f\n\n")
+            content_parts.append(f"{self.CLR_DIM}Edited    : {time.strftime('%Y-%m-%d %H:%M', time.localtime(edited))}`f\n")
+        content_parts.append(f"{self.CLR_DIM}Status    : {scope.capitalize()}`f\n\n")
 
         # Document content
-        content = doc.get("content", "").strip()
+        content = content.strip()
         if content:
             if fmt == "micron": content_parts.append(content)
             else: content_parts.append(self.mdc.format_block(content))
@@ -1511,7 +1659,7 @@ class NomadNetworkNode():
         st = time.time()
         RNS.log(f"Artifact file request from {remote_identity}", RNS.LOG_DEBUG)
 
-        if not data: data = {}
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "") if data else ""
         repo_name = data.get("var_r", "") if data else ""
         tag = data.get("var_t", "") if data else ""
@@ -1529,10 +1677,13 @@ class NomadNetworkNode():
         releases_path = f"{repo['path']}.releases"
 
         if tag == "latest":
-            releases = self.owner.releases_list_data(releases_path)
+            releases, latest_release = self.owner.releases_list_data(releases_path)
             if not releases: return None
-            recent_releases = sorted(releases, key=lambda x: x['created'], reverse=True)
-            tag = recent_releases[0]["tag"]
+            if not latest_release:
+                recent_releases = sorted(releases, key=lambda x: x['created'], reverse=True)
+                tag = recent_releases[0]["tag"]
+
+            else: tag = latest_release
 
         release_dir = os.path.join(releases_path, tag)
         artifacts_dir = os.path.join(release_dir, "artifacts")
@@ -1561,12 +1712,14 @@ class NomadNetworkNode():
 
         RNS.log(f"Artifact file resolved for artifact request {group_name}/{repo_name}/{tag}/{artifact}", RNS.LOG_DEBUG)
 
+        self.owner.release_download_succeeded(group_name, repo_name, remote_identity)
         return [open(artifact_path, "rb"), {"name": artifact.encode("utf-8")}]
 
     def serve_download(self, path, data, request_id, link_id, remote_identity, requested_at):
         st = time.time()
         RNS.log(f"File download request from {remote_identity}", RNS.LOG_DEBUG)
 
+        if not data or not type(data) == dict: data = {}
         group_name = data.get("var_g", "")   if data else ""
         repo_name = data.get("var_r", "")    if data else ""
         ref = data.get("var_ref", "HEAD")    if data else "HEAD"
@@ -1597,11 +1750,89 @@ class NomadNetworkNode():
         
         else:
             stream = self.get_blob_stream(repo_path, resolved_ref, file_path)
-            if stream is not None: return [stream, {"name": file_name.encode("utf-8")}]
+            if stream is not None:
+                self.owner.download_succeeded(group_name, repo_name, remote_identity)
+                return [stream, {"name": file_name.encode("utf-8")}]
+            
             else:
                 RNS.log(f"Could not resolve blob stream for download request {group_name}/{repo_name}/{ref}/{file_path}", RNS.LOG_WARNING)
                 return None
 
+        return None
+
+    def serve_wd_download(self, path, data, request_id, link_id, remote_identity, requested_at):
+        st = time.time()
+        RNS.log(f"Workdoc download request from {remote_identity}", RNS.LOG_DEBUG)
+
+        if not data or not type(data) == dict: data = {}
+        group_name = data.get("var_g", "") if data else ""
+        repo_name  = data.get("var_r", "") if data else ""
+        doc_id     = data.get("var_id", "") if data else ""
+        scope      = data.get("var_scope", "all") if data else "all"
+        if scope not in ["active", "completed", "all"]: scope = "active"
+
+        if not group_name or not repo_name or not doc_id:
+            RNS.log(f"Invalid workdoc download request for {group_name[:128]}/{repo_name[:128]}/{doc_id[:128]}", RNS.LOG_WARNING)
+            return None
+
+        try: doc_id = int(doc_id)
+        except:
+            if not type(doc_id) == str or not type(doc_id) == bytes: doc_id = f"{doc_id}"
+            RNS.log(f"Could not parse document ID for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id[:128]}", RNS.LOG_WARNING)
+            return None
+
+        repo = self.get_accessible_repository(remote_identity, group_name, repo_name)
+        if not repo:
+            RNS.log(f"Repository not found or no access for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id}", RNS.LOG_WARNING)
+            return None
+
+        doc_access = self.resolve_doc_permission(remote_identity, group_name, repo_name, doc_id, self.owner.PERM_READ)
+        if not doc_access:
+            RNS.log(f"No access for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id}", RNS.LOG_WARNING)
+            return None
+
+        work_path     = f"{repo['path']}.work"
+        active_dir    = os.path.join(work_path, "active", str(doc_id))
+        completed_dir = os.path.join(work_path, "completed", str(doc_id))
+        proposed_dir  = os.path.join(work_path, "proposed", str(doc_id))
+        if   scope == "active":    doc_dir = active_dir
+        elif scope == "completed": doc_dir = completed_dir
+        elif scope == "proposed":  doc_dir = proposed_dir
+        elif scope == "all":
+            if os.path.isdir(active_dir):
+                doc_dir = active_dir
+                scope = "active"
+
+            elif os.path.isdir(completed_dir):
+                doc_dir = completed_dir
+                scope = "completed"
+
+            else:
+                doc_dir = proposed_dir
+                scope = "proposed"
+
+        root_path = os.path.join(doc_dir, "root")
+
+        if not os.path.isfile(root_path):
+            RNS.log(f"Document not found for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id[:128]}", RNS.LOG_WARNING)
+            return None
+
+        doc = self.owner._work_load_document(root_path)
+        if not doc:
+            RNS.log(f"Could not load document for workdoc download request {group_name[:128]}/{repo_name[:128]}/{doc_id[:128]}", RNS.LOG_WARNING)
+            return None
+
+        meta    = doc.get("meta", {})
+        fmt     = meta.get("format", "markdown")
+        title   = meta.get('title', 'Untitled')[:256]
+        content = doc.get("content", "").strip()
+
+        if content:
+            if fmt == "micron": file_name = f"{title}.mu"
+            else:               file_name = f"{title}.md"
+            self.owner.download_succeeded(group_name, repo_name, remote_identity)
+            return [file_name, content.encode("utf-8")]
+            
         return None
 
     #######################
@@ -1755,6 +1986,15 @@ class NomadNetworkNode():
 
             size = int(result.stdout.strip())
 
+            # Check if it's a tree via ls-tree
+            check_tree_path = f"{ref}:{file_path}" if file_path else ref
+            result = subprocess.run(["git", "ls-tree", check_tree_path],
+                                    cwd=repo_path, capture_output=True, text=True,
+                                    timeout=self.GIT_COMMAND_TIMEOUT, check=False)
+
+            if result.returncode == 0: is_tree = True
+            else:                      is_tree = False
+
             # Check if it's a symlink via ls-tree
             parent_dir = "/".join(file_path.split("/")[:-1])
             filename = file_path.split("/")[-1]
@@ -1803,6 +2043,7 @@ class NomadNetworkNode():
                             if first_line.startswith("-"): is_binary = True
 
             return { "size": size,
+                     "is_tree": is_tree,
                      "is_binary": is_binary,
                      "is_symlink": is_symlink,
                      "symlink_target": symlink_target }
@@ -1970,7 +2211,8 @@ class NomadNetworkNode():
                      "committer_date": lines[6],
                      "message": "\n".join(lines[7:]).strip(),
                      "files": [],
-                     "diff": None }
+                     "diff": None,
+                     "signature_status": None }
 
             # Get file change statistics
             stats_result = subprocess.run(["git", "diff-tree", "--numstat", "-r", commit_hash],
@@ -2040,6 +2282,84 @@ class NomadNetworkNode():
             RNS.log(f"Error getting commit info: {e}", RNS.LOG_WARNING)
             return None
 
+    def get_commit_signature(self, repo_path, commit_hash):
+        try:
+            result = subprocess.run(["git", "cat-file", "-p", commit_hash],
+                                    cwd=repo_path, capture_output=True, text=True,
+                                    timeout=self.GIT_COMMAND_TIMEOUT, check=False)
+
+            if result.returncode != 0:
+                return {"signed": False, "valid": False, "signer_hash": None,
+                        "author_match": False, "message": "Could not read commit object"}
+
+            commit_content = result.stdout
+            lines = commit_content.split("\n")
+            sig_lines = []
+            in_signature = False
+            signed_content_lines = []
+
+            for line in lines:
+                if line.startswith("gpgsig ") or line.startswith("gpgsig-sha256 "):
+                    in_signature = True
+                    sig_start = line.find(" ") + 1
+                    sig_lines.append(line[sig_start:])
+
+                elif in_signature:
+                    if line.startswith(" "): sig_lines.append(line[1:])
+                    else:
+                        in_signature = False
+                        signed_content_lines.append(line)
+
+                else: signed_content_lines.append(line)
+
+            if not sig_lines:
+                return {"signed": False, "valid": False, "signer_hash": None,
+                        "author_match": False, "message": "Not signed"}
+
+            armored_sig = "\n".join(sig_lines)
+            signed_content = "\n".join(signed_content_lines).encode("utf-8")
+
+            try:
+                sig_data = unarmor_ssh_signature(armored_sig)
+                try: rsg = parse_ssh_signature(sig_data)["signature_data"]
+                except ValueError as e:
+                    return {"signed": True, "valid": False, "signer_hash": None,
+                            "author_match": False, "message": "Malformed SSH wrapping for RSG data"}
+
+                valid, signed_rsg_data, signing_identity = validate_rsg(rsg, signed_content)
+                if not valid:
+                    return {"signed": True, "valid": False, "signer_hash": None,
+                            "author_match": False, "message": "Invalid signature"}
+
+                signer_hash = RNS.hexrep(signing_identity.hash, delimit=False)
+                author = extract_commit_author(signed_content)
+
+                if not author:
+                    return {"signed": True, "valid": True, "signer_hash": signer_hash,
+                            "author_match": False, "message": "Could not verify author"}
+
+                if author == signer_hash:
+                    return {"signed": True, "valid": True, "signer_hash": signer_hash,
+                            "author_match": True, "message": f"Valid, signed by <{signer_hash}>"}
+                else:
+                    return {"signed": True, "valid": True, "signer_hash": signer_hash,
+                            "author_match": False, "message": f"Invalid signer <{signer_hash}>, author is <{author}>"}
+
+            except Exception as e:
+                RNS.log(f"Error validating commit signature: {e}", RNS.LOG_DEBUG)
+                return {"signed": True, "valid": False, "signer_hash": None,
+                        "author_match": False, "message": "Signature validation error"}
+
+        except subprocess.TimeoutExpired:
+            RNS.log(f"Timeout checking commit signature", RNS.LOG_WARNING)
+            return {"signed": False, "valid": False, "signer_hash": None,
+                    "author_match": False, "message": "Timeout"}
+
+        except Exception as e:
+            RNS.log(f"Error checking commit signature: {e}", RNS.LOG_DEBUG)
+            return {"signed": False, "valid": False, "signer_hash": None,
+                    "author_match": False, "message": "Error"}
+
     def get_readme_content(self, repo_path):
         readme_names = [ ("README.mu", False),  ("Readme.mu", False),  ("readme.mu", False), ("README", False),
                          ("readme", False),     ("README.md", True),   ("readme.md", True),  ("README.rst", False),
@@ -2102,22 +2422,31 @@ class NomadNetworkNode():
         for line in lines:
             if line.startswith("+"):
                 if line.startswith("+++"): formatted_lines.append(self.m_escape(line))
-                else:                      formatted_lines.append(f"`F0a0{self.m_escape(line)}`f")
+                else:                      formatted_lines.append(f"{self.CLR_DIFF_A}{self.m_escape(line)}`f")
             
             elif line.startswith("-"):
                 if line.startswith("---"): formatted_lines.append(self.m_escape(f"\\{line}"))
-                else:                      formatted_lines.append(f"`F900{self.m_escape(line)}`f")
+                else:                      formatted_lines.append(f"{self.CLR_DIFF_R}{self.m_escape(line)}`f")
             elif line.startswith("@@"):
-                formatted_lines.append(f"`F0aa{self.m_escape(line)}`f")
+                formatted_lines.append(f"{self.CLR_DIFF_P}{self.m_escape(line)}`f")
 
             elif line.startswith("diff ") or line.startswith("index ") or line.startswith("new file") or line.startswith("deleted file"):
                 if line.startswith("diff --git a"): formatted_lines.append("")
-                formatted_lines.append(f"`F666{self.m_escape(line)}`f")
+                formatted_lines.append(f"{self.CLR_DIM}{self.m_escape(line)}`f")
 
             else: formatted_lines.append(self.m_escape(line))
         
         return "\n".join(formatted_lines)
 
+    def format_commit(self, diff_text):
+        lines = diff_text.replace("\\", "\\\\").split("\n")
+        formatted_lines = []
+
+        for line in lines:
+            if line.startswith("-"): formatted_lines.append(self.m_escape(f"\\{line}"))
+            else:                    formatted_lines.append(self.m_escape(line))
+
+        return "\n".join(formatted_lines)
 
     def repository_thanks(self, repo_path, add=False, link_id=None):
         if add:
@@ -2141,7 +2470,7 @@ class NomadNetworkNode():
                 with open(thanks_path, "wb") as fh: fh.write(mp.packb({"count": thanks_count}))
                 return thanks_count
 
-        except Exception as e: RNS.log(f"Error while processing repository thanks for {group_name}/{repo_name}: {e}", RNS.LOG_ERROR)
+        except Exception as e: RNS.log(f"Error while processing repository thanks for {repo_path}: {e}", RNS.LOG_ERROR)
         return 0
 
     def release_thanks(self, release_path, add=False, link_id=None):
@@ -2166,14 +2495,17 @@ class NomadNetworkNode():
                 with open(thanks_path, "wb") as fh: fh.write(mp.packb({"count": thanks_count}))
                 return thanks_count
 
-        except Exception as e: RNS.log(f"Error while processing release thanks for {group_name}/{repo_name}: {e}", RNS.LOG_ERROR)
+        except Exception as e: RNS.log(f"Error while processing release thanks for {release_path}: {e}", RNS.LOG_ERROR)
         return 0
 
     ###################
     # Stats Renderers #
     ###################
 
-    def render_chart(self, data, labels, color="666", height=10):
+    def render_chart(self, data, labels, color="666", height=10, secondary_color=None, gradient_factor=None):
+        return self.render_chart_halfblock(data, labels, color=color, height=height, secondary_color=secondary_color, gradient_factor=gradient_factor)
+
+    def render_chart_full_block(self, data, labels, color="666", height=10):
         if not data or all(d == 0 for d in data): return "No data available\n"        
         max_val = max(data) if max(data) > 0 else 1
         num_points = len(data)
@@ -2182,8 +2514,8 @@ class NomadNetworkNode():
         indent = ""
         bar_width = 1
 
-        chart_lines = []
-        chart_lines.append(f"{indent}`F{color}Peak: {max_val}`f\n")
+        lines = []
+        lines.append(f"{indent}`F{color}Peak: {max_val}`f\n")
         for row in range(height, 0, -1):
             threshold = (row - 1) / height * max_val
             row_line = f"{indent}│"
@@ -2194,58 +2526,6 @@ class NomadNetworkNode():
                     elif row >= height * 0.375: row_line += f"`F{color}{'▒'*bar_width}`f{hsep}"
                     else:                       row_line += f"`F{color}{'░'*bar_width}`f{hsep}"
                 else:                           row_line += f"{' '*bar_width}{hsep}"
-            row_line += "\n"
-            chart_lines.append(row_line)
-        
-        hsj = "┴"*len(hsep)
-        bottom_border = "└" + hsj.join(["─" * bar_width] * num_points) + "┘"
-        chart_lines.append(indent + bottom_border + "\n")
-
-        chart_width = len(bottom_border)
-        first_label = f"{labels[0][:12]:<12}"
-        final_label = f"{labels[-1][:12]:>12}"
-        middle_space = chart_width-len(first_label)-len(final_label)
-
-        label_line = f"{indent}`F666{first_label}`f"
-        label_line += " " * middle_space
-        label_line += f"`F666{final_label}`f\n"
-        chart_lines.append(label_line)
-        
-        return "".join(chart_lines)
-
-    # TODO: This is a weird idea, really. Probably redo it to something else.
-    def render_combined_chart(self, views, fetches, pushes, labels, height=4):
-        if not views or not labels: return "No data available\n"
-        
-        all_data = [v + f + p for v, f, p in zip(views, fetches, pushes)]
-        max_val = max(all_data) if all(all_data) > 0 else 1
-        num_points = len(views)
-        
-        hsep = ""
-        indent = ""
-        bar_width = 1
-
-        lines = []
-        lines.append(f"{indent}`F66d██`f Views  `F0a0██`f Fetches  `Faa0██`f Pushes\n\n")
-        for row in range(height, 0, -1):
-            threshold = (row - 1) / height * max_val
-            row_line = f"{indent}│"
-            for i in range(num_points):
-                v, f, p = views[i], fetches[i], pushes[i]
-                total = v + f + p
-                
-                if total > threshold:
-                    # Determine which "layer" this row represents
-                    # Priority: Pushes > fetches > views for display
-                    if p > 0 and threshold < (v + f + p) and threshold >= (v + f): row_line += f"`Faa0{'█'*bar_width}`f{hsep}"
-                    elif f > 0 and threshold < (v + f) and threshold >= v:         row_line += f"`F0a0{'▓'*bar_width}`f{hsep}"
-                    elif v > 0 and threshold < v:                                  row_line += f"`F66d{'░'*bar_width}`f{hsep}"
-                    else:
-                        # Mixed or partial, show dominant
-                        if p >= f and p >= v: row_line += f"`Faa0{'▒'*bar_width}`f{hsep}"
-                        elif f >= v:          row_line += f"`F0a0{'▒'*bar_width}`f{hsep}"
-                        else:                 row_line += f"`F66d{'▒'*bar_width}`f{hsep}"
-                else:                         row_line += f"{' '*bar_width}{hsep}"
             row_line += "\n"
             lines.append(row_line)
         
@@ -2258,12 +2538,156 @@ class NomadNetworkNode():
         final_label = f"{labels[-1][:12]:>12}"
         middle_space = chart_width-len(first_label)-len(final_label)
 
-        label_line = f"{indent}`F666{first_label}`f"
+        label_line = f"{indent}{self.CLR_DIM}{first_label}`f"
         label_line += " " * middle_space
-        label_line += f"`F666{final_label}`f\n"
+        label_line += f"{self.CLR_DIM}{final_label}`f\n"
         lines.append(label_line)
         
         return "".join(lines)
+
+    def render_chart_halfblock(self, data, labels, color="666", height=10, secondary_color=None, gradient_factor=None):
+        if not gradient_factor: gradient_factor = 1.3
+        if not data or all(d == 0 for d in data): return "No data available\n"
+        max_val    = max(data) if max(data) > 0 else 1
+        num_points = len(data)
+
+        def hex_to_rgb(h):     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        def expand_color(c):   return ''.join(ch * 2 for ch in c) if len(c) == 3 else c[:6]
+        def gradient_color(t): return ''.join(f"{int(secondary_rgb[i] + (primary_rgb[i] - secondary_rgb[i]) * min(1, t*gradient_factor)):02x}" for i in range(3))
+
+        primary = expand_color(color)
+        if secondary_color: secondary = expand_color(secondary_color)
+        else: secondary = ''.join(f"{int(int(primary[i:i+2], 16) * 0.42):02x}" for i in (0, 2, 4))
+        
+        primary_rgb   = hex_to_rgb(primary)
+        secondary_rgb = hex_to_rgb(secondary)
+        
+        lines = [f"`FT{primary}Peak: {max_val}`f\n"]
+        for row in range(height, 0, -1):
+            row_top = (row / height) * max_val
+            row_bottom = ((row - 1) / height) * max_val
+            row_mid = (row_top + row_bottom) / 2
+
+            grad_top = row / height
+            grad_mid = (row - 0.5) / height
+            
+            line = "│"
+            for val in data:
+                upper_filled = val >= row_top
+                lower_filled = val >= row_mid or row == 1 and val > 0
+
+                if not upper_filled and not lower_filled: line += " "
+                elif upper_filled: line += f"`FT{gradient_color(grad_top)}`BT{gradient_color(grad_mid)}▀`f`b"
+                else:              line += f"`FT{gradient_color(grad_mid)}▄`f"
+
+            lines.append(line + "\n")
+
+        hsep = ""
+        indent = ""
+        bar_width = 1
+
+        hsj = "┴"*len(hsep)
+        bottom_border = "└" + hsj.join(["─" * bar_width] * num_points) + "┘"
+        lines.append(indent + bottom_border + "\n")
+
+        chart_width = len(bottom_border)
+        first_label = f"{labels[0][:12]:<12}"
+        final_label = f"{labels[-1][:12]:>12}"
+        middle_space = chart_width-len(first_label)-len(final_label)
+
+        label_line = f"{indent}{self.CLR_DIM}{first_label}`f"
+        label_line += " " * middle_space
+        label_line += f"{self.CLR_DIM}{final_label}`f\n"
+        lines.append(label_line)
+        
+        return "".join(lines)
+
+    def render_combined_chart(self, views, fetches, pushes, downloads, labels, height=6, colors=None, dim=0.87):
+        if not views or not all([views, fetches, pushes, downloads]): return "No data available\n"
+        
+        if colors is None:
+            colors = { 'views':     self.RCLR_VIEW,
+                       'fetches':   self.RCLR_FETCH,
+                       'pushes':    self.RCLR_PUSH,
+                       'downloads': self.RCLR_DOWNLOAD }
+
+        def expand(c): return ''.join(ch*2 for ch in c) if len(c) == 3 else c[:6]
+        def hex_to_rgb(h):     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        def gradient_color(c, g, t, f=1.0): c = hex_to_rgb(c); g = hex_to_rgb(g); return ''.join(f"{int(g[i] + (c[i] - g[i]) * min(1, t*f)):02x}" for i in range(3))
+        cat_colors = {'views':     gradient_color(expand(colors.get('views',     self.RCLR_VIEW)), "000000", dim),
+                      'fetches':   gradient_color(expand(colors.get('fetches',   self.RCLR_FETCH)), "000000", dim),
+                      'pushes':    gradient_color(expand(colors.get('pushes',    self.RCLR_PUSH)), "000000", dim),
+                      'downloads': gradient_color(expand(colors.get('downloads', self.RCLR_DOWNLOAD)), "000000", dim) }
+        
+        # Stack order
+        categories = ['pushes', 'fetches', 'views', 'downloads']
+        cat_data = [pushes, fetches, views, downloads]
+        
+        num_points = len(views)
+        legend = "  ".join(f"`FT{cat_colors[cat]}`BT{cat_colors[cat]}██`f`b {cat.capitalize()}" for cat in categories)
+        lines = [f"{legend}\n\n"]
+        
+        for row in range(height, 0, -1):
+            lower_min = (row - 1) / height
+            lower_max = (row - 0.5) / height
+            upper_min = (row - 0.5) / height
+            upper_max = row / height
+            
+            line = "│"
+            
+            for i in range(num_points):
+                total = sum(d[i] for d in cat_data)
+                if total == 0:
+                    line += " "
+                    continue
+                
+                cumsum = 0
+                cat_ranges = {}
+                for cat, data in zip(categories, cat_data):
+                    start = cumsum / total
+                    cumsum += data[i]
+                    end = cumsum / total
+                    cat_ranges[cat] = (start, end)
+                
+                def pixel_to_cat(pmin, pmax):
+                    for cat in categories:
+                        cstart, cend = cat_ranges[cat]
+                        # Check if pixel overlaps this category
+                        # Return the category (they're mutually exclusive in stacked chart)
+                        if pmin < cend and pmax > cstart: return cat
+                    return None
+                
+                upper_cat = pixel_to_cat(upper_min, upper_max)
+                lower_cat = pixel_to_cat(lower_min, lower_max)
+                
+                if upper_cat is None and lower_cat is None: line += " "
+                elif upper_cat == lower_cat and upper_cat is not None:
+                    col = cat_colors[upper_cat]
+                    line += f"`FT{col}`BT{col}█`f`b"
+                elif upper_cat is not None and lower_cat is not None:
+                    upper_col = cat_colors[upper_cat]
+                    lower_col = cat_colors[lower_cat]
+                    line += f"`FT{upper_col}`BT{lower_col}▀`f`b"
+                elif upper_cat is not None:
+                    col = cat_colors[upper_cat]
+                    line += f"`FT{col}▀`f"
+                else:
+                    col = cat_colors[lower_cat]
+                    line += f"`FT{col}▄`f"
+            
+            lines.append(line + "\n")
+        
+        bottom = "└" + "─" * num_points + "┘"
+        lines.append(bottom + "\n")
+        
+        if labels:
+            first = str(labels[0])[:12]
+            last  = str(labels[-1])[:12]
+            mid_space = len(bottom) - len(first) - len(last)
+            lines.append(f"{self.CLR_DIM}{first}{' ' * mid_space}{last}`f\n")
+        
+        return "".join(lines)
+
 
     #######################
     # Connection Handlers #

@@ -1,14 +1,10 @@
 # Code Examples
 
-A number of examples are included in the source distribution of Reticulum.
-You can use these examples to learn how to write your own programs.
+A number of examples are included in the source distribution of Reticulum. You can use these examples to learn how to write your own programs.
 
 ## Minimal
 
-The *Minimal* example demonstrates the bare-minimum setup required to connect to
-a Reticulum network from your program. In about five lines of code, you will
-have the Reticulum Network Stack initialised, and ready to pass traffic in your
-program.
+The *Minimal* example demonstrates the bare-minimum setup required to connect to a Reticulum network from your program. In about five lines of code, you will have the Reticulum Network Stack initialised, and ready to pass traffic in your program.
 
 ```default
 ##########################################################
@@ -61,7 +57,6 @@ def program_setup(configpath):
     # Let's hand over control to the announce loop
     announceLoop(destination)
 
-
 def announceLoop(destination):
     # Let the user know that everything is ready
     RNS.log(
@@ -78,7 +73,6 @@ def announceLoop(destination):
         entered = input()
         destination.announce()
         RNS.log("Sent announce from "+RNS.prettyhexrep(destination.hash))
-
 
 ##########################################################
 #### Program Startup #####################################
@@ -119,9 +113,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Announce
 
-The *Announce* example builds upon the previous example by exploring how to
-announce a destination on the network, and how to let your program receive
-notifications about announces from relevant destinations.
+The *Announce* example builds upon the previous example by exploring how to announce a destination on the network, and how to let your program receive notifications about announces from relevant destinations.
 
 ```default
 ##########################################################
@@ -201,7 +193,6 @@ def program_setup(configpath):
     # Everything's ready!
     # Let's hand over control to the announce loop
     announceLoop(destination_1, destination_2)
-
 
 def announceLoop(destination_1, destination_2):
     # Let the user know that everything is ready
@@ -302,8 +293,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Broadcast
 
-The *Broadcast* example explores how to transmit plaintext broadcast messages
-over the network.
+The *Broadcast* example explores how to transmit plaintext broadcast messages over the network.
 
 ```default
 ##########################################################
@@ -380,7 +370,6 @@ def broadcastLoop(destination):
             packet.send()
 
 
-
 ##########################################################
 #### Program Startup #####################################
 ##########################################################
@@ -433,8 +422,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Echo
 
-The *Echo* example demonstrates communication between two destinations using
-the Packet interface.
+The *Echo* example demonstrates communication between two destinations using the Packet interface.
 
 ```default
 ##########################################################
@@ -453,7 +441,6 @@ import RNS
 # is part of a range of example utilities, we'll put
 # them all within the app namespace "example_utilities"
 APP_NAME = "example_utilities"
-
 
 ##########################################################
 #### Server Part #########################################
@@ -500,7 +487,6 @@ def server(configpath):
     # Let's Wait for client requests or user input
     announceLoop(echo_destination)
 
-
 def announceLoop(destination):
     # Let the user know that everything is ready
     RNS.log(
@@ -517,7 +503,6 @@ def announceLoop(destination):
         entered = input()
         destination.announce()
         RNS.log("Sent announce from "+RNS.prettyhexrep(destination.hash))
-
 
 def server_callback(message, packet):
     global reticulum
@@ -546,7 +531,6 @@ def server_callback(message, packet):
             reception_stats += " [SNR "+str(packet.snr)+" dB]"
 
     RNS.log("Received packet from echo client, proof sent"+reception_stats)
-
 
 ##########################################################
 #### Client Part #########################################
@@ -698,7 +682,6 @@ def packet_timed_out(receipt):
     if receipt.status == RNS.PacketReceipt.FAILED:
         RNS.log("Packet "+RNS.prettyhexrep(receipt.hash)+" timed out")
 
-
 ##########################################################
 #### Program Startup #####################################
 ##########################################################
@@ -775,8 +758,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Link
 
-The *Link* example explores establishing an encrypted link to a remote
-destination, and passing traffic back and forth over the link.
+The *Link* example explores establishing an encrypted link to a remote destination, and passing traffic back and forth over the link.
 
 ```default
 ##########################################################
@@ -876,7 +858,6 @@ def server_packet_received(message, packet):
     reply_text = "I received \""+text+"\" over the link"
     reply_data = reply_text.encode("utf-8")
     RNS.Packet(latest_client_link, reply_data).send()
-
 
 ##########################################################
 #### Client Part #########################################
@@ -1014,7 +995,6 @@ def client_packet_received(message, packet):
     print("> ", end=" ")
     sys.stdout.flush()
 
-
 ##########################################################
 #### Program Startup #####################################
 ##########################################################
@@ -1075,8 +1055,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Identification
 
-The *Identify* example explores identifying an intiator of a link, once
-the link has been established.
+The *Identify* example explores identifying an intiator of a link, once the link has been established.
 
 ```default
 ##########################################################
@@ -1186,7 +1165,6 @@ def server_packet_received(message, packet):
     reply_text = "I received \""+text+"\" over the link from "+remote_peer
     reply_data = reply_text.encode("utf-8")
     RNS.Packet(latest_client_link, reply_data).send()
-
 
 ##########################################################
 #### Client Part #########################################
@@ -1336,7 +1314,6 @@ def client_packet_received(message, packet):
     RNS.log("Received data on the link: "+text)
     print("> ", end=" ")
     sys.stdout.flush()
-
 
 ##########################################################
 #### Program Startup #####################################
@@ -1499,7 +1476,6 @@ def client_connected(link):
 def client_disconnected(link):
     RNS.log("Client disconnected")
 
-
 ##########################################################
 #### Client Part #########################################
 ##########################################################
@@ -1588,7 +1564,6 @@ def client_loop():
                     failed_callback = request_failed
                 )
 
-
         except Exception as e:
             RNS.log("Error while sending request over the link: "+str(e))
             should_quit = True
@@ -1605,7 +1580,6 @@ def request_received(request_receipt):
 
 def request_failed(request_receipt):
     RNS.log("The request "+RNS.prettyhexrep(request_receipt.request_id)+" failed.")
-
 
 # This function is called when a link
 # has been established with the server
@@ -1631,7 +1605,6 @@ def link_closed(link):
     
     time.sleep(1.5)
     sys.exit(0)
-
 
 ##########################################################
 #### Program Startup #####################################
@@ -1693,8 +1666,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Channel
 
-The *Channel* example explores using a `Channel` to send structured
-data between peers of a `Link`.
+The *Channel* example explores using a `Channel` to send structured data between peers of a `Link`.
 
 ```default
 ##########################################################
@@ -1783,7 +1755,6 @@ class StringMessage(RNS.MessageBase):
     # the message contents.
     def unpack(self, raw):
         self.data, self.timestamp = umsgpack.unpackb(raw)
-
 
 ##########################################################
 #### Server Part #########################################
@@ -1887,7 +1858,6 @@ def server_message_received(message):
         # is considered handled and any subsequent
         # handlers are skipped.
         return True
-
 
 ##########################################################
 #### Client Part #########################################
@@ -2031,7 +2001,6 @@ def client_message_received(message):
         print("> ", end=" ")
         sys.stdout.flush()
 
-
 ##########################################################
 #### Program Startup #####################################
 ##########################################################
@@ -2092,8 +2061,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Buffer
 
-The *Buffer* example explores using buffered readers and writers to send
-binary data between peers of a `Link`.
+The *Buffer* example explores using buffered readers and writers to send binary data between peers of a `Link`.
 
 ```default
 ##########################################################
@@ -2116,7 +2084,6 @@ from RNS.vendor import umsgpack
 # is part of a range of example utilities, we'll put
 # them all within the app namespace "example_utilities"
 APP_NAME = "example_utilities"
-
 
 ##########################################################
 #### Server Part #########################################
@@ -2190,7 +2157,6 @@ def client_connected(link):
     if latest_buffer:
         latest_buffer.close()
 
-
     # Create buffer objects.
     #   The stream_id parameter to these functions is
     #   a bit like a file descriptor, except that it
@@ -2224,7 +2190,6 @@ def server_buffer_ready(ready_bytes: int):
     reply_message = reply_message.encode("utf-8")
     latest_buffer.write(reply_message)
     latest_buffer.flush()
-
 
 
 
@@ -2319,7 +2284,6 @@ def client_loop():
                 # Flush the buffer to force the data to be sent.
                 buffer.flush()
 
-
         except Exception as e:
             RNS.log("Error while sending data over the link buffer: "+str(e))
             should_quit = True
@@ -2362,7 +2326,6 @@ def client_buffer_ready(ready_bytes: int):
     RNS.log("Received data over the link buffer: " + data.decode("utf-8"))
     print("> ", end=" ")
     sys.stdout.flush()
-
 
 ##########################################################
 #### Program Startup #####################################
@@ -2424,9 +2387,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Filetransfer
 
-The *Filetransfer* example implements a basic file-server program that
-allow clients to connect and download files. The program uses the Resource
-interface to efficiently pass files of any size over a Reticulum [Link](reference.md#api-link).
+The *Filetransfer* example implements a basic file-server program that allow clients to connect and download files. The program uses the Resource interface to efficiently pass files of any size over a Reticulum [Link](reference.md#api-link).
 
 ```default
 ##########################################################
@@ -2639,7 +2600,6 @@ download_time     = 0
 transfer_size     = 0
 file_size         = 0
 
-
 # This initialisation is executed when the users chooses
 # to run as a client
 def client(destination_hexhash, configpath):
@@ -2659,7 +2619,6 @@ def client(destination_hexhash, configpath):
 
     # We must first initialise Reticulum
     reticulum = RNS.Reticulum(configpath)
-
 
     # Check if we know a path to the destination
     if not RNS.Transport.has_path(destination_hash):
@@ -2895,7 +2854,6 @@ def filelist_timeout_job():
         RNS.log("Timed out waiting for filelist, exiting")
         sys.exit(0)
 
-
 # When a link is closed, we'll inform the
 # user, and exit the program
 def link_closed(link):
@@ -3038,10 +2996,7 @@ This example can also be found at [https://github.com/markqvist/Reticulum/blob/m
 
 ## Custom Interfaces
 
-The *ExampleInterface* demonstrates creating custom interfaces for Reticulum.
-Any number of custom interfaces can be loaded and utilised by Reticulum, and
-will be fully on-par with natively included interfaces, including all supported
-[interface modes](interfaces.md#interfaces-modes) and [common configuration options](interfaces.md#interfaces-options).
+The *ExampleInterface* demonstrates creating custom interfaces for Reticulum. Any number of custom interfaces can be loaded and utilised by Reticulum, and will be fully on-par with natively included interfaces, including all supported [interface modes](interfaces.md#interfaces-modes) and [common configuration options](interfaces.md#interfaces-options).
 
 ```default
 # This example illustrates creating a custom interface
@@ -3225,7 +3180,6 @@ class ExampleInterface(Interface):
         thread.start()
         self.online = True
         RNS.log("Serial port "+self.port+" is now open", RNS.LOG_VERBOSE)
-
 
     # This method will be called from our read-loop
     # whenever a full packet has been received over
