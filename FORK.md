@@ -6,13 +6,14 @@ by Mark Qvist, owned by the MeshForge project (Nursedude).
 ## Base
 
 - **Upstream:** `markqvist/Reticulum`
-- **Forked at tag:** `1.2.5`
-- **Base commit:** `e8d161c0d50cc0416c98dcd1cee44807e7c52df1`
+- **Forked at tag:** `1.2.5` (original vendoring anchor)
+- **Current base tag:** `1.3.8` (merged 2026-07-17; see Upstream merge history)
 - **Fork branch:** `meshforge`
 - **Version scheme:** PEP 440 local marker on the upstream base —
-  `1.2.5+mf.0`, `1.2.5+mf.1`, … The base version (`1.2.5`) is never
-  changed independently of upstream; only the `+mf.N` segment increments
-  for MeshForge changes.
+  `<base>+mf.0`, `<base>+mf.1`, … The base version is never changed
+  independently of upstream; only the `+mf.N` segment increments for
+  MeshForge changes, and it resets to `+mf.0` when the base is bumped to a
+  new upstream tag.
 
 ## Why this fork exists
 
@@ -66,3 +67,35 @@ Stock RNS may publish future releases off-GitHub. To incorporate one:
 
 Bump the base version to match upstream and reset the local marker to `+mf.0`
 for the new base.
+
+## Upstream merge history
+
+### `1.2.5+mf.5` → `1.3.8+mf.0` (2026-07-17)
+
+Adopted upstream `1.3.8`. Wire-compat invariant cleared (crypto primitives
+untouched; the one big transport change — the shared-instance RPC rewrite to
+msgpack byte-mode — is LOCAL client↔rnsd IPC, not the network wire). Conflicts
+were confined to `RNS/Reticulum.py` (20 RPC-callsite hunks) and `_version.py`.
+
+Two reconciliation lessons, both load-bearing for future merges:
+
+- **`#72` is not subsumed.** Upstream's `get_rpc_client()` is still a bare
+  `Client()` with no timeout and a raw blocking `recv_bytes()`, so a wedged
+  rnsd still hangs. The bounded `_rpc_recv` (poll-then-recv) was re-ported onto
+  the new msgpack framing and all 21 client recv sites route through it —
+  keeping upstream's per-site try/except AND the wedge bound. Do not drop this
+  on a future merge just because upstream "added error handling."
+- **`mf.4` was re-ported, not carried verbatim.** The original `mf.4` made
+  `logging_lock` an `RLock` so `log()`'s on-write-failure fallback (which
+  re-calls `log()` under the lock) wouldn't self-deadlock. Live re-validation on
+  1.3.8's link/resource suite showed the RLock's per-acquire overhead on the hot
+  logging path flaked LOG_EXTREME resource transfers (controlled A/B on clean
+  1.3.8: plain `Lock` 9/9 pass, `RLock` 2/5 fail). Cured structurally instead —
+  keep a plain `Lock`, run the fallback re-log *after* releasing it. This is the
+  general rule: prefer the narrowest fix, and re-validate a carried patch against
+  the new base rather than assuming a textual auto-merge preserved its behavior.
+
+Not fleet-rolled at merge time: the `meshforge` branch stays at `1.2.5+mf.5`
+until a one-box canary + wedge-probe/clean-stop soak + public-net interop proof
+pass. The msgpack RPC rewrite is box-local, so a box's client and rnsd must be
+upgraded together (coordinated per-box, never rapid-cycle).
