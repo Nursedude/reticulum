@@ -341,14 +341,23 @@ class AutoInterface(Interface):
                 self.bitrate = AutoInterface.BITRATE_GUESS
 
     def _bind_when_ready(self, bind, what):
-        deadline = time.monotonic() + AutoInterface.LINKLOCAL_BIND_TIMEOUT
+        # Logged at NOTICE on purpose: this path runs at most once per boot, and
+        # a reboot drill must be able to see that it ran, not just infer it.
+        started = time.monotonic()
+        deadline = started + AutoInterface.LINKLOCAL_BIND_TIMEOUT
+        retried = False
         while True:
             try:
-                return bind()
+                result = bind()
+                if retried:
+                    RNS.log(f"{self} {what}: bound after {time.monotonic()-started:.1f}s wait for the link-local address", RNS.LOG_NOTICE)
+                return result
             except OSError as e:
                 if e.errno != errno.EADDRNOTAVAIL or time.monotonic() >= deadline:
                     raise
-                RNS.log(f"{self} {what}: address not assignable yet (IPv6 DAD tentative?), retrying", RNS.LOG_DEBUG)
+                if not retried:
+                    RNS.log(f"{self} {what}: address not assignable yet (IPv6 DAD tentative?), retrying for up to {AutoInterface.LINKLOCAL_BIND_TIMEOUT:.0f}s", RNS.LOG_NOTICE)
+                    retried = True
                 time.sleep(AutoInterface.LINKLOCAL_BIND_RETRY)
 
     def final_init(self):

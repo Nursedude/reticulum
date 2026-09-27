@@ -99,3 +99,20 @@ Not fleet-rolled at merge time: the `meshforge` branch stays at `1.2.5+mf.5`
 until a one-box canary + wedge-probe/clean-stop soak + public-net interop proof
 pass. The msgpack RPC rewrite is box-local, so a box's client and rnsd must be
 upgraded together (coordinated per-box, never rapid-cycle).
+
+## MeshForge patch history on the `1.3.8` base
+
+### `1.3.8+mf.1` (2026-09-26) — AutoInterface survives a tentative link-local
+
+rnsd exited 255 at boot when it started inside the IPv6 DAD window: the
+fe80 address was still `tentative`, the unicast discovery bind got
+`EADDRNOTAVAIL`, `__init__` logged "skipping it" but left the interface
+adopted, and `final_init()` re-bound it unguarded. Seen on moc5 (2026-09-19,
+where the 5 s dead window let two lab daemons squat `@rns`, 42 min without
+RNS) and VolcanoAI (2026-09-26). `network-online.target` does not cover it:
+NetworkManager reports online before DAD completes.
+
+Cure: `_bind_when_ready()` retries EADDRNOTAVAIL only, bounded at 10 s, and
+logs at NOTICE so a reboot drill can see the path ran; a failed interface is
+un-adopted so "skipping it" is true. Test: `tests/meshforge_autointerface_dad.py`
+(the rollback cases fail on the unpatched tree). No wire or crypto change.
