@@ -35,6 +35,7 @@ import threading
 import re
 import socket
 import struct
+import errno
 import time
 import sys
 import RNS
@@ -68,6 +69,13 @@ class AutoInterface(Interface):
     ANDROID_IGNORE_IFS = ["dummy0", "lo", "tun0", "rmnet0", "rmnet1", "rmnet2", "rmnet3", "rmnet4", "rmnet5", "rmnet6", "rmnet7"]
 
     BITRATE_GUESS      = 10*1000*1000
+
+    # MeshForge fork (mf.1): the kernel refuses to bind a link-local address
+    # while IPv6 DAD holds it "tentative" (EADDRNOTAVAIL, ~1-2 s after carrier).
+    # At boot rnsd can start inside that window, even after network-online.
+    # Wait it out, bounded; past the bound the error propagates as before.
+    LINKLOCAL_BIND_TIMEOUT = 10.0
+    LINKLOCAL_BIND_RETRY   =  0.5
 
     MULTI_IF_DEQUE_LEN = 48
     MULTI_IF_DEQUE_TTL = 0.75
@@ -213,6 +221,7 @@ class AutoInterface(Interface):
 
         suitable_interfaces = 0
         for ifname in self.list_interfaces():
+            link_local_mark = len(self.link_local_addresses)
             try:
                 if RNS.vendor.platformutils.is_darwin() and ifname in AutoInterface.DARWIN_IGNORE_IFS and not ifname in self.allowed_interfaces:
                     RNS.log(str(self)+" skipping Darwin AWDL or tethering interface "+str(ifname), RNS.LOG_EXTREME)
@@ -266,7 +275,7 @@ class AutoInterface(Interface):
 
                                 else:
                                     addr_info = socket.getaddrinfo(link_local_addr+"%"+ifname, self.unicast_discovery_port, socket.AF_INET6, socket.SOCK_DGRAM)
-                                    unicast_discovery_socket.bind(addr_info[0][4])
+                                    self._bind_when_ready(lambda: unicast_discovery_socket.bind(addr_info[0][4]), f"unicast discovery listener on {ifname}")
 
                                 mcast_addr = self.mcast_discovery_address
                                 RNS.log(str(self)+" Creating multicast discovery listener on "+str(ifname)+" with address "+str(mcast_addr), RNS.LOG_EXTREME)
@@ -307,6 +316,14 @@ class AutoInterface(Interface):
                                 suitable_interfaces += 1
 
             except Exception as e:
+                # MeshForge fork (mf.1): undo a half-adoption. The interface is
+                # adopted before its sockets bind, so without this a failed bind
+                # left it in adopted_interfaces and final_init() re-bound the same
+                # address unguarded, killing rnsd (exit 255) instead of skipping.
+                self.adopted_interfaces.pop(ifname, None)
+                self.multicast_echoes.pop(ifname, None)
+                del self.link_local_addresses[link_local_mark:]
+
                 nice_name = self.netinfo.interface_name_to_nice_name(ifname)
                 if nice_name != None and nice_name != ifname:
                     RNS.log(f"Could not configure the system interface {nice_name} / {ifname} for use with {self}, skipping it. The contained exception was: {e}", RNS.LOG_ERROR)
@@ -323,6 +340,17 @@ class AutoInterface(Interface):
             else:
                 self.bitrate = AutoInterface.BITRATE_GUESS
 
+    def _bind_when_ready(self, bind, what):
+        deadline = time.monotonic() + AutoInterface.LINKLOCAL_BIND_TIMEOUT
+        while True:
+            try:
+                return bind()
+            except OSError as e:
+                if e.errno != errno.EADDRNOTAVAIL or time.monotonic() >= deadline:
+                    raise
+                RNS.log(f"{self} {what}: address not assignable yet (IPv6 DAD tentative?), retrying", RNS.LOG_DEBUG)
+                time.sleep(AutoInterface.LINKLOCAL_BIND_RETRY)
+
     def final_init(self):
         peering_wait = self.announce_interval*1.2
         RNS.log(str(self)+" discovering peers for "+str(round(peering_wait, 2))+" seconds...", RNS.LOG_VERBOSE)
@@ -334,7 +362,7 @@ class AutoInterface(Interface):
             addr_info = socket.getaddrinfo(local_addr, self.data_port, socket.AF_INET6, socket.SOCK_DGRAM)
             address = addr_info[0][4]
 
-            udp_server = socketserver.UDPServer(address, self.handler_factory(self.process_incoming))
+            udp_server = self._bind_when_ready(lambda: socketserver.UDPServer(address, self.handler_factory(self.process_incoming)), f"data listener on {ifname}")
             self.interface_servers[ifname] = udp_server
             
             thread = threading.Thread(target=udp_server.serve_forever)
