@@ -379,7 +379,7 @@ class BackboneInterface(Interface):
                                             try: client_socket.close()
                                             except Exception as e: RNS.log(f"Error while closing socket for failed incoming connection: {e}", RNS.LOG_WARNING)
 
-                                    except:
+                                    except Exception as e:
                                         RNS.log(f"Accepting socket failed for incoming connection: {e}", RNS.LOG_WARNING)
                                         try: client_socket.close()
                                         except Exception as e: RNS.log(f"Error while closing socket for failed incoming socket accept: {e}", RNS.LOG_WARNING)

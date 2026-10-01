@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### Unreleased (next `+mf.N`) (2026-10-01) — a refused `require_shared_instance` client releases `@rns`
+### `1.3.8+mf.3` (2026-10-01) — a refused `require_shared_instance` client releases `@rns`
 
 `Reticulum(require_shared_instance=True)` with no shared instance running
 binds `LocalServerInterface` on `@rns/<instance>`, calls `detach()`, then
@@ -125,6 +125,20 @@ another's iteration. Teardown is unchanged in effect: `deregister_listeners()`
 already closed this socket right after `detach()`. Test:
 `tests/meshforge_require_shared_release.py` (fails on the unpatched tree with
 the name still bound). Local socket handling only; no wire or crypto change.
+
+Why it matters on the fleet: every LOCAL `rnstatus` run passes
+`require_shared_instance=True` (`rnstatus.py:159-160`, `715-716`), and
+MeshForge's probes run `rnstatus` routinely. While rnsd is down (a restart, a
+boot), each such run held `@rns` until it exited. Reviewed before tagging by
+two independent readers (SHIP-WITH-NOTES, both): one confirmed the fix also
+releases the TCP (`shared_instance_type = tcp`) and non-epoll listeners.
+
+Also in this release: `BackboneInterface`'s accept handler was a bare
+`except:` that logged an unbound `e`, so a failed `accept()` (e.g. racing a
+listener close) raised UnboundLocalError and killed the epoll I/O thread for
+every Backbone/Local interface in the process. Found independently by both
+reviewers; now `except Exception as e:`. Test:
+`tests/meshforge_backbone_accept_except.py`.
 
 ### `1.3.8+mf.2` (2026-10-01) — `interface_mode = gateway` no longer crashes rnsd
 
