@@ -102,6 +102,21 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### Unreleased (next `+mf.N`) (2026-10-01) — `interface_mode = gateway` no longer crashes rnsd
+
+`_synthesize_interface`'s `interface_mode` branch tested `c["mode"]` for the
+`gateway`/`gw` and `internal` values, so a stanza that set only
+`interface_mode = gateway` raised `KeyError('mode')`. That happens before
+the method's `try`, so the error escapes the `Reticulum()` constructor and
+rnsd fails at startup. `mode = gateway` was unaffected; every other
+`interface_mode` value already read the right key. Found while writing the
+interface-mode guidance for MeshForge's templates (research R9).
+
+Cure: read `c["interface_mode"]` in those two branches. Test:
+`tests/meshforge_interface_mode_key.py` (fails with KeyError on the
+unpatched tree, and checks that both keys agree for every mode). Config
+parsing only; no wire or crypto change.
+
 ### `1.3.8+mf.1` (2026-09-26) — AutoInterface survives a tentative link-local
 
 rnsd exited 255 at boot when it started inside the IPv6 DAD window: the
