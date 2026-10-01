@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### Unreleased (next `+mf.N`) (2026-10-01) — `interface_mode = gateway` no longer crashes rnsd
+### `1.3.8+mf.2` (2026-10-01) — `interface_mode = gateway` no longer crashes rnsd
 
 `_synthesize_interface`'s `interface_mode` branch tested `c["mode"]` for the
 `gateway`/`gw` and `internal` values, so a stanza that set only
