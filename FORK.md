@@ -102,6 +102,30 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### Unreleased (next `+mf.N`) (2026-10-01) — a refused `require_shared_instance` client releases `@rns`
+
+`Reticulum(require_shared_instance=True)` with no shared instance running
+binds `LocalServerInterface` on `@rns/<instance>`, calls `detach()`, then
+raises `SystemError`. `LocalServerInterface` had no `detach()` of its own: it
+inherited `Interface.detach()`, a no-op, so the listener stayed bound and
+accepting for the rest of the process's life. Measured 2026-10-01 in a
+private network namespace: the name stayed bound for 8 s after the refusal,
+and a host started 3 s in came up `shared_instance=False,
+connected_to_shared=True`, attached to a refused process with no RPC socket.
+That is the #69 squatter, produced by the flag meant to refuse it. Found while
+checking MeshMonitor's attach mode (research M3).
+
+Cure: `LocalServerInterface.detach()` deregisters its epoll listener and
+closes it (an abstract unix name is freed only on close; `shutdown()` alone,
+as `BackboneInterface.detach()` does, would leave it bound), or shuts down
+and closes the `ThreadingTCPServer` on the non-epoll path. The
+`listener_filenos` entry is left in place: a closed socket's `fileno()` is -1,
+so the epoll loop's guard skips it and no thread mutates the dict under
+another's iteration. Teardown is unchanged in effect: `deregister_listeners()`
+already closed this socket right after `detach()`. Test:
+`tests/meshforge_require_shared_release.py` (fails on the unpatched tree with
+the name still bound). Local socket handling only; no wire or crypto change.
+
 ### `1.3.8+mf.2` (2026-10-01) — `interface_mode = gateway` no longer crashes rnsd
 
 `_synthesize_interface`'s `interface_mode` branch tested `c["mode"]` for the

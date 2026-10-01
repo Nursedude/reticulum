@@ -501,6 +501,31 @@ class LocalServerInterface(Interface):
         self.bitrate = 1000*1000*1000
         self.online = True
 
+    # MeshForge fork: release the shared-instance listener. Upstream inherits
+    # Interface.detach() (a no-op), so Reticulum's require_shared_instance
+    # refusal path ("detach, then raise SystemError") left @rns/<instance>
+    # bound and accepting for the rest of the process's life, and an rnsd
+    # starting meanwhile joined it as a CLIENT: the #69 squatter, created by
+    # the flag meant to refuse it. An abstract unix name is freed only on
+    # close(), so close the socket, not just shut it down. The listener_filenos
+    # entry is left in place on purpose: a closed socket's fileno() is -1, so
+    # the epoll loop's `fileno == server_socket.fileno()` guard skips it, and
+    # nothing mutates the dict under another thread's iteration.
+    def detach(self):
+        self.detached = True
+        self.online = False
+        if self.epoll_backend:
+            for fileno, (owner_interface, server_socket) in list(BackboneInterface.listener_filenos.items()):
+                if owner_interface is self:
+                    BackboneInterface.deregister_fileno(server_socket.fileno())
+                    try: server_socket.close()
+                    except Exception as e: RNS.log(f"Error while closing shared instance listener for {self}: {e}", RNS.LOG_ERROR)
+        elif getattr(self, "server", None) != None:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception as e: RNS.log(f"Error while closing shared instance server for {self}: {e}", RNS.LOG_ERROR)
+
     def incoming_connection(self, handler):
         if self.epoll_backend:
             client_socket = handler
