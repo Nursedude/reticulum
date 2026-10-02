@@ -102,6 +102,21 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### Unreleased (next `+mf.N`) (2026-10-01) — a `require_shared_instance` refusal can be retried in-process
+
+`__init__` latches `Reticulum.__instance` on its first line, and the
+`require_shared_instance` refusal raised without clearing it, so the same
+process could never construct again: `OSError("Attempt to reinitialise
+Reticulum")`. Worse for a guarded caller, `get_instance()` then returned the
+refused, half-built object as if it were live. Cure: clear the latch before
+the `SystemError` (the refusal happens before `Transport.start`, signal
+handlers and `atexit`, and mf.3 already released the listener), and set a
+class marker `MF_REQUIRE_SHARED_RETRYABLE = True` that callers feature-detect.
+Test: `tests/meshforge_require_shared_retry.py` (fails on the unpatched tree
+with "refusal left a half-built singleton"; then joins a real host on retry).
+Consumer: MeshForge `open_reticulum` constructs join-only once its probe has
+decided to join rnsd (#69 check-then-construct race). No wire or crypto change.
+
 ### `1.3.8+mf.3` (2026-10-01) — a refused `require_shared_instance` client releases `@rns`
 
 `Reticulum(require_shared_instance=True)` with no shared instance running

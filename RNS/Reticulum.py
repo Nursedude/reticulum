@@ -90,6 +90,11 @@ class Reticulum:
 
     # Future minimum will probably be locked in at 251 bytes to support
     # networks with segments of different MTUs. Absolute minimum is 219.
+    # MeshForge fork marker: a require_shared_instance refusal releases @rns
+    # (mf.3) AND clears the singleton (mf.4), so a caller may retry in-process.
+    # Callers feature-detect this; stock RNS leaves a half-built singleton.
+    MF_REQUIRE_SHARED_RETRYABLE = True
+
     MTU            = 500
     """
     The MTU that Reticulum adheres to, and will expect other peers to
@@ -472,6 +477,13 @@ class Reticulum:
                     self.is_connected_to_shared_instance = False
 
             if self.is_shared_instance and self.require_shared:
+                # MeshForge fork: undo the refusal completely so the caller can
+                # retry in-process once rnsd is up. The listener was already
+                # released (LocalServerInterface.detach, mf.3); the singleton
+                # latch set at the top of __init__ is the other half. Nothing
+                # past this point (Transport.start, signal handlers, atexit)
+                # has run yet.
+                Reticulum.__instance = None
                 raise SystemError("No shared instance available, but application that started Reticulum required it")
 
         else:
