@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### Unreleased (next `+mf.N`) (2026-10-01) — a `require_shared_instance` refusal can be retried in-process
+### `1.3.8+mf.4` (2026-10-01) — join-only never binds `@rns`, and a refusal can be retried in-process
 
 `__init__` latches `Reticulum.__instance` on its first line, and the
 `require_shared_instance` refusal raised without clearing it, so the same
@@ -116,6 +116,17 @@ Test: `tests/meshforge_require_shared_retry.py` (fails on the unpatched tree
 with "refusal left a half-built singleton"; then joins a real host on retry).
 Consumer: MeshForge `open_reticulum` constructs join-only once its probe has
 decided to join rnsd (#69 check-then-construct race). No wire or crypto change.
+
+Second half, from the review pair (both SHIP-WITH-NOTES; one MEASURED it):
+join-only still BOUND the listener before detaching, so under three refusing
+clients a starting host lost its bind and then failed to connect, ending
+standalone with no `@rns` in 7 of 100 trials (11 of 100 in our own control
+run of the same script). Now `require_shared_instance=True` skips the bind
+entirely and goes straight to the client branch, a join-only client does not
+mark itself `wanted_host`, and the refusal fires whenever join-only did not
+actually JOIN (upstream tested `is_shared_instance` only, so a join-only
+process whose bind and connect both failed ran standalone). Same script on
+this build: 0 of 100.
 
 ### `1.3.8+mf.3` (2026-10-01) — a refused `require_shared_instance` client releases `@rns`
 

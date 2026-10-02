@@ -419,6 +419,14 @@ class Reticulum:
     def __start_local_interface(self):
         if self.share_instance:
             try:
+                # MeshForge fork (mf.4): join-only NEVER binds the shared-instance
+                # listener. Binding then detaching (upstream, and mf.3) left a
+                # window where a starting rnsd lost its bind and then failed to
+                # connect, ending standalone with no @rns (measured: 7 of 100
+                # trials under three refusing clients). Go straight to the client
+                # branch below; a failed connect is then a clean refusal.
+                if self.require_shared == True:
+                    raise ConnectionRefusedError("join-only: not binding the shared-instance listener")
                 interface = LocalInterface.LocalServerInterface(RNS.Transport, self.local_interface_port, socket_path=self.local_socket_path)
                 interface.OUT = True
                 if hasattr(Reticulum, "_force_shared_instance_bitrate"):
@@ -454,7 +462,7 @@ class Reticulum:
                     # escalate (exit-to-restart, opt-in via RNS_EXIT_ON_HOST_LOSS=1)
                     # if the actual host later dies, instead of reconnect-looping
                     # at a dead socket forever.
-                    interface.wanted_host = True
+                    interface.wanted_host = not self.require_shared
                     if hasattr(Reticulum, "_force_shared_instance_bitrate"):
                         interface.bitrate = Reticulum._force_shared_instance_bitrate
                         interface._force_bitrate = True
@@ -470,13 +478,19 @@ class Reticulum:
                     RNS.log("Connected to locally available Reticulum instance via: "+str(interface), RNS.LOG_DEBUG)
 
                 except Exception as e:
-                    RNS.log("Local shared instance appears to be running, but it could not be connected", RNS.LOG_ERROR)
-                    RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
+                    if self.require_shared == True:
+                        RNS.log("No local shared instance to join: "+str(e), RNS.LOG_VERBOSE)
+                    else:
+                        RNS.log("Local shared instance appears to be running, but it could not be connected", RNS.LOG_ERROR)
+                        RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
                     self.is_shared_instance = False
                     self.is_standalone_instance = True
                     self.is_connected_to_shared_instance = False
 
-            if self.is_shared_instance and self.require_shared:
+            # mf.4: refuse whenever join-only did not actually JOIN — upstream
+            # tested is_shared_instance only, so a join-only process whose bind
+            # and connect both failed silently ran STANDALONE instead.
+            if self.require_shared and not self.is_connected_to_shared_instance:
                 # MeshForge fork: undo the refusal completely so the caller can
                 # retry in-process once rnsd is up. The listener was already
                 # released (LocalServerInterface.detach, mf.3); the singleton
