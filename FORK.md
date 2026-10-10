@@ -118,8 +118,13 @@ while loading. Continuing without it.` at CRITICAL, and continues. A panic on
 any other thread, or after the load, is still `os._exit(255)` (pinned).
 Scope, stated: LOAD time only — a plugin thread that panics later still exits
 rnsd. Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
-unpatched tree: rc 255 / rc 3; the two controls pass on both). No wire or
-crypto change. Upstream: not checked (ships off-GitHub); offer-back row owed.
+unpatched tree: rc 255 / rc 3; the two controls pass on both). Live drill
+2026-10-10 (real rnsd, private configdir, `share_instance = No`, TCP server
+iface + the SMCI-shaped plugin), run twice: patched alive, TCP listening and
+accepting, refusal logged; unpatched `1.3.8+mf.4` control exit 255, TCP never
+up. Run rnsd with `PYTHONUNBUFFERED=1` when its stdout is a file — every exit
+path is `os._exit()`, which drops buffered log lines. No wire or crypto
+change. Upstream: not checked (ships off-GitHub); offer-back row owed.
 
 ### `1.3.8+mf.4` (2026-10-01) — join-only never binds `@rns`, and a refusal can be retried in-process
 
