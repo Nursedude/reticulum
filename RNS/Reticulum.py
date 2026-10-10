@@ -1079,6 +1079,12 @@ class Reticulum:
                         RNS.log(f"Could not locate external interface module \"{interface_file}\" in \"{self.interfacepath}\"", RNS.LOG_ERROR)
                     
                     else:
+                        # MeshForge fork: a plugin that calls RNS.panic() or
+                        # sys.exit() while loading costs THAT interface, not
+                        # the process (and with it every other interface on
+                        # the shared instance). See RNS.panic.
+                        guard = RNS._external_interface_load
+                        guard.depth = getattr(guard, "depth", 0) + 1
                         try:
                             RNS.log(f"Loading external interface \"{interface_file}\" from \"{self.interfacepath}\"", RNS.LOG_NOTICE)
                             interface_globals = {}
@@ -1088,14 +1094,22 @@ class Reticulum:
                                 interface_code = class_file.read()
                                 exec(interface_code, interface_globals)
                                 interface_class = interface_globals["interface_class"]
-                                
+
                                 if interface_class != None:
                                     interface = interface_class(RNS.Transport, interface_config)
                                     interface_post_init(interface)
 
-                        except Exception as e:
+                        except (Exception, SystemExit) as e:
+                            interface = None
+                            if isinstance(e, RNS.ExternalInterfacePanic):
+                                RNS.log(f"External interface {interface_type} / {name} refused: it called RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
+                            elif isinstance(e, SystemExit):
+                                RNS.log(f"External interface {interface_type} / {name} refused: it called sys.exit({e.code!r}) while loading. Continuing without it.", RNS.LOG_CRITICAL)
                             RNS.log(f"External interface initialisation failed for {interface_type} / {name}", RNS.LOG_ERROR)
                             RNS.trace_exception(e)
+
+                        finally:
+                            guard.depth -= 1
 
             else:
                 RNS.log("Skipping disabled interface \""+name+"\"", RNS.LOG_DEBUG)

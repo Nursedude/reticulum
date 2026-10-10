@@ -102,6 +102,25 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### UNRELEASED (2026-10-10) — an external interface that panics while loading costs that interface, not rnsd
+
+Upstream wraps the exec + constructor of a user-supplied `interfaces/*.py`
+module in `except Exception`. That contains an ordinary error, but not
+`RNS.panic()` (`os._exit(255)`) or `SystemExit` — so one plugin took down
+every interface on the shared instance, RNode leg included. Measured shape:
+SMCI (Reticulum-Smart-MeshCore-Interface @5038e023fa) calls `RNS.panic()`
+from `__init__` when `import meshcore` fails (its 0.1.0 changelog: "the
+interface panics rnsd without it"). Cure: while THIS thread loads an external
+interface (`RNS._external_interface_load` depth > 0, thread-local),
+`RNS.panic()` raises `RNS.ExternalInterfacePanic` instead of exiting; the
+loader also catches `SystemExit`, logs `... refused: it called RNS.panic()
+while loading. Continuing without it.` at CRITICAL, and continues. A panic on
+any other thread, or after the load, is still `os._exit(255)` (pinned).
+Scope, stated: LOAD time only — a plugin thread that panics later still exits
+rnsd. Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
+unpatched tree: rc 255 / rc 3; the two controls pass on both). No wire or
+crypto change. Upstream: not checked (ships off-GitHub); offer-back row owed.
+
 ### `1.3.8+mf.4` (2026-10-01) — join-only never binds `@rns`, and a refusal can be retried in-process
 
 `__init__` latches `Reticulum.__instance` on its first line, and the

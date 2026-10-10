@@ -371,7 +371,19 @@ def phyparams():
     print("Link Public Key Size        : "+str(Link.ECPUBSIZE*8)+" bits")
     print("Link Private Key Size       : "+str(Link.KEYSIZE*8)+" bits")
 
-def panic(): os._exit(255)
+class ExternalInterfacePanic(Exception):
+    """RNS.panic() called while a user-supplied interface module was loading.
+    MeshForge fork: that costs the interface, not the process."""
+
+# MeshForge fork: >0 while THIS thread is loading an external interface
+# (Reticulum._synthesize_interface). Thread-local so a panic on any other
+# thread — including threads the plugin starts — stays fatal.
+_external_interface_load = threading.local()
+
+def panic():
+    if getattr(_external_interface_load, "depth", 0) > 0:
+        raise ExternalInterfacePanic("RNS.panic() called while loading an external interface")
+    os._exit(255)
 
 exit_called = False
 def exit(code=0):
