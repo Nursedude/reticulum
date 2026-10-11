@@ -25,10 +25,16 @@ import RNS
 from RNS.Interfaces import PipeInterface as PI
 
 CHILD = textwrap.dedent("""
-    import sys
-    # drain stdin forever, write nothing back
+    import os, sys, time
+    # drain stdin forever, write nothing back; argv "slow" = drain 200 B per
+    # 100 ms (a LoRa-rate consumer that is alive but behind)
+    slow = "slow" in sys.argv[1:]
+    fd = sys.stdin.fileno()
     while True:
-        if not sys.stdin.buffer.read(4096):
+        if slow:
+            if not os.read(fd, 200): break
+            time.sleep(0.1)
+        elif not os.read(fd, 4096):
             break
 """)
 
@@ -152,6 +158,63 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         time.sleep(0.5)
         self.assertEqual(self.iface.tx_dropped, 0, f"{self.iface.tx_dropped} frames dropped with a healthy child")
         self.assertTrue(self.iface.online)
+
+
+    def test_slow_child_costs_a_caller_one_wait_per_congestion_episode(self):
+        """Transport-forwarding drill 2026-10-10: with `enable_transport = Yes`
+        a forwarded frame is transmitted on the reader thread of the interface
+        it ARRIVED on. A child that drains, but slower than it is offered,
+        kept `_tx_last_drain` fresh so the stall check never fired, and every
+        frame past its drain rate paid TX_PUT_WAIT_S on that reader: 100 f/s
+        x 20 ms saturated it, and control traffic on the arriving TCP
+        interface (never touching the pipe) ran 8 s median / 20 s worst.
+        Once a put has timed out, the next frames must not wait again until
+        the queue has drained to TX_LOW_WATER."""
+        slow = PI.PipeInterface(self.owner, {"name": "slow", "command": self.cfg["command"] + " slow"})
+        orig = self.iface
+        self.addCleanup(lambda: slow.process.kill())
+        self.addCleanup(lambda: orig.process.kill())
+        self.iface = slow  # every reference below is to the slow child's interface
+        # Isolate the caller cost from the stall detector: never go offline here.
+        with mock.patch.object(PI.PipeInterface, "TX_STALL_S", 3600.0):
+            deadline = time.monotonic() + 20
+            while self.iface.tx_dropped == 0 and time.monotonic() < deadline:
+                self.iface.process_outgoing(b"c" * 1000)
+            self.assertGreater(self.iface.tx_dropped, 0, "queue never filled behind the slow child")
+            slow_calls = 0; total = 0.0
+            for _ in range(100):
+                t = time.monotonic(); self.iface.process_outgoing(b"c" * 1000); dt = time.monotonic() - t
+                total += dt
+                if dt >= 0.015: slow_calls += 1
+            self.assertTrue(self.iface.online, "went offline; the measurement would be vacuous")
+        self.assertLessEqual(slow_calls, 2, f"{slow_calls} of 100 calls waited for a slot ({total:.2f}s on the caller)")
+
+    def test_stall_recovery_waits_for_the_queue_to_drain_to_low_water(self):
+        """Same drill: a child draining 2 kB/s on a 16 KB-page kernel frees a
+        pipe page every ~8 s > TX_STALL_S, so the interface flapped Down/Up
+        every ~8 s (the first completed write after a stall flipped it back
+        with the queue still full). Recovery must wait until the queue has
+        drained to TX_LOW_WATER."""
+        at_flip = []
+        real_log = RNS.log
+        def spy(msg, *a, **k):
+            if "draining again" in str(msg): at_flip.append(self.iface._txq.qsize())
+            return real_log(msg, *a, **k)
+        os.kill(self.child_pid, signal.SIGSTOP)
+        self._fill_pipe()
+        deadline = time.monotonic() + PI.PipeInterface.TX_STALL_S + 5
+        while self.iface.online and time.monotonic() < deadline:
+            self.iface.process_outgoing(b"y" * 1000); time.sleep(0.2)
+        self.assertFalse(self.iface.online)
+        with mock.patch.object(RNS, "log", spy):
+            os.kill(self.child_pid, signal.SIGCONT)
+            deadline = time.monotonic() + 10
+            while not self.iface.online and time.monotonic() < deadline:
+                time.sleep(0.05)
+        self.assertTrue(self.iface.online)
+        self.assertEqual(len(at_flip), 1, at_flip)
+        self.assertLessEqual(at_flip[0], PI.PipeInterface.TX_QUEUE_DEPTH // 2,
+                             f"came back online with {at_flip[0]} frames still queued")
 
 
 if __name__ == "__main__":

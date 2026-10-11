@@ -72,6 +72,19 @@ class PipeInterface(Interface):
     # is dropped (fresh pass F2: a 64-deep queue dropped frames a healthy
     # child would have taken, because the writer had not had the GIL yet).
     TX_PUT_WAIT_S = 0.02
+    # ...but at most ONCE per congestion episode. With `enable_transport =
+    # Yes` a forwarded frame is transmitted on the reader thread of the
+    # interface it ARRIVED on; a child that drains slower than it is offered
+    # keeps completing writes, so the stall check never fires, and a wait on
+    # every frame saturated that reader (transport-forwarding drill
+    # 2026-10-10: 100 f/s x 20 ms; control traffic on the arriving TCP
+    # interface ran 8 s median / 20 s worst). After one put times out the
+    # interface is congested: frames are offered without waiting (dropped
+    # only if the queue is full) until the queue has drained to TX_LOW_WATER.
+    # The same mark gates recovery from a stall, so a child that frees a
+    # pipe page less often than TX_STALL_S (16 KB pages at 2 kB/s: ~8 s)
+    # does not flap Down/Up on every page.
+    TX_LOW_WATER = TX_QUEUE_DEPTH // 2
 
     owner    = None
     command  = None
@@ -105,6 +118,7 @@ class PipeInterface(Interface):
         self._txq = queue.Queue(maxsize=PipeInterface.TX_QUEUE_DEPTH)
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
+        self._tx_congested = False
         self._writer_gen = 0
         self._writer = None
 
@@ -146,6 +160,7 @@ class PipeInterface(Interface):
             self._writer.join(1.0)
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
+        self._tx_congested = False
         self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
                                         name=f"pipe-writer-{self.name}")
         self._writer.start()
@@ -161,9 +176,13 @@ class PipeInterface(Interface):
     def process_outgoing(self,data):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
+            if self._tx_congested and self._txq.qsize() <= PipeInterface.TX_LOW_WATER:
+                self._tx_congested = False
             try:
-                self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
+                if self._tx_congested: self._txq.put_nowait(data)
+                else: self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
             except queue.Full:
+                self._tx_congested = True
                 self.tx_dropped += 1
                 self._check_tx_stall()
         elif self._tx_stalled:
@@ -204,7 +223,8 @@ class PipeInterface(Interface):
             self._tx_last_drain = time.monotonic()
             if written != len(data):
                 RNS.log("Pipe interface only wrote "+str(written)+" bytes of "+str(len(data)), RNS.LOG_ERROR)
-            if self._tx_stalled and gen == self._writer_gen and self.pipe_is_open and not self.detached:
+            if (self._tx_stalled and gen == self._writer_gen and self.pipe_is_open and not self.detached
+                    and self._txq.qsize() <= PipeInterface.TX_LOW_WATER):
                 self._tx_stalled = False
                 self.online = True
                 RNS.log(f"{self} subprocess is draining again; interface is back online ({self.tx_dropped} frame(s) dropped during the stall)", RNS.LOG_WARNING)

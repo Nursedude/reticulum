@@ -102,6 +102,38 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### `1.3.8+mf.7` (UNRELEASED) — a slow PipeInterface child costs a forwarding reader one wait per congestion episode, and stops flapping
+
+Transport-forwarding drill 2026-10-10 (three private instances: TCP client →
+router with `enable_transport = Yes` → PipeInterface → relay child → TCP →
+far instance; 100 forwarded frames/s + 25/s control to the router itself):
+with `enable_transport = Yes` a forwarded frame is transmitted on the reader
+thread of the interface it ARRIVED on, so on `1.3.8+mf.6` a child that drains
+but slower than it is offered made every frame past its drain rate wait
+`TX_PUT_WAIT_S` (20 ms) on that reader. The child kept completing writes, so
+the stall check never fired: at 4 kB/s the control traffic on the arriving
+TCP interface — which never touches the pipe — ran 8 s median / 20.5 s
+worst, the pipe never Down. At 2 kB/s the interface instead flapped Down/Up
+every ~8 s: on a 16 KB-page kernel the writer gets room only when the child
+has consumed a whole page (16 KB ÷ 2 kB/s > `TX_STALL_S`), and the first
+completed write flipped it back with the queue still full. A SIGSTOPped
+child was fine (1.23 s worst, ×2); stock was worse in every shape (rnsd's
+own announcing thread froze). Cure: once a put times out the interface is
+CONGESTED — frames are offered with `put_nowait` (dropped and counted only
+if the queue is full) until the queue has drained to `TX_LOW_WATER`
+(`TX_QUEUE_DEPTH // 2` = 128), so each caller pays at most one wait per
+episode; a healthy-child burst still gets the back-pressure (fresh pass F2:
+a draining child frees slots, so `put_nowait` rarely meets a full queue).
+The same mark gates recovery from a stall: the interface comes back Up when
+a write completes AND the queue is at or below `TX_LOW_WATER`, so a slow
+child no longer flaps on every page. Not changed: stall detection (still the
+drop path, still `TX_STALL_S` from the last completed write), queue depth,
+respawn. Tests (in `tests/meshforge_pipe_interface_stall.py`, red on
+`5f9d0553` = `1.3.8+mf.6` code): a child started with `slow` (200 B per
+100 ms) — 100 of 100 calls waited for a slot (2.01 s on the caller), now ≤ 2;
+SIGSTOP → offline → SIGCONT — Up with 256 frames still queued, now ≤ 128.
+No wire or crypto change.
+
 ### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
 
 Stock `PipeInterface.process_outgoing()` does a blocking `stdin.write()` on
