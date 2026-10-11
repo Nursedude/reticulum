@@ -14,6 +14,13 @@ from RNS.Transport import Transport
 from RNS.Interfaces.LocalInterface import LocalServerInterface, LocalClientInterface
 
 
+# Released in tearDown. Transport's detach_job threads are daemon=False by
+# design, so a detach() that blocked FOREVER kept the interpreter alive after
+# the last test: a one-process run of the meshforge_* files never exited
+# (review 2026-10-10 F7). "Blocks longer than DETACH_TIMEOUT" is the property.
+_RELEASE = threading.Event()
+
+
 def _blocking_iface(cls=None):
     """A fake interface whose detach() blocks forever. If cls is given, the
     object's exact type() is cls (so Transport's `type(x) == LocalServerInterface`
@@ -24,7 +31,7 @@ def _blocking_iface(cls=None):
 
     def _block():
         started.set()
-        threading.Event().wait()  # never returns
+        _RELEASE.wait()  # outlives DETACH_TIMEOUT; released in tearDown
 
     iface.detach = _block
     iface._mf_started = started
@@ -53,6 +60,9 @@ class MeshForgeDetachTimeoutTest(unittest.TestCase):
         self._patch.start()
 
     def tearDown(self):
+        global _RELEASE
+        _RELEASE.set()                # let parked detach threads finish
+        _RELEASE = threading.Event()  # the next test blocks again
         self._patch.stop()
         for k, v in self._saved.items():
             setattr(Transport, k, v)

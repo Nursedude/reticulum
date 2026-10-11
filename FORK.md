@@ -116,9 +116,23 @@ interface (`RNS._external_interface_load` depth > 0, thread-local),
 loader also catches `SystemExit`, logs `... refused: it called RNS.panic()
 while loading. Continuing without it.` at CRITICAL, and continues. A panic on
 any other thread, or after the load, is still `os._exit(255)` (pinned).
-Scope, stated: LOAD time only — a plugin thread that panics later still exits
-rnsd. Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
-unpatched tree: rc 255 / rc 3; the two controls pass on both). Live drill
+Scope, stated: LOAD time, on the loading thread, via `RNS.panic()` or
+`sys.exit()` only. NOT contained, each measured by the non-author review
+(2026-10-10): a panic on a thread the plugin starts (during load or later),
+a runtime panic after the load, a direct `os._exit()`, and `RNS.exit()`
+(which detaches EVERY interface, then exits — read, not run). A plugin that
+holds a Transport lock across its panic leaves it held (contrived; stated).
+Review fixes (same entry, not yet tagged): `ExternalInterfacePanic` is a
+`BaseException`, so a plugin's own `except Exception` cannot swallow a panic
+and load as healthy (F2); and a refusal now UNREGISTERS and detaches an
+interface that `interface_post_init` had already added before `final_init()`
+failed, instead of leaving a dead entry while the log says it is gone (F1).
+Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
+unpatched tree: rc 255 / rc 3; the two controls pass on both; the two review
+cases fail on `0f8f637f` with `REGISTERED 1`, pass after). Also fixed:
+`tests/meshforge_detach_timeout.py` parked non-daemon detach threads forever,
+so a one-process run of the `meshforge_*` files never exited (now released in
+`tearDown`; all 52 pass and exit 0). Live drill
 2026-10-10 (real rnsd, private configdir, `share_instance = No`, TCP server
 iface + the SMCI-shaped plugin), run twice: patched alive, TCP listening and
 accepting, refusal logged; unpatched `1.3.8+mf.4` control exit 255, TCP never

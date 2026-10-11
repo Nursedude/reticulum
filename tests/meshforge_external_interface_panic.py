@@ -30,7 +30,9 @@ CHILD = textwrap.dedent("""
     me = mock.MagicMock()
     me.interfacepath = {ipath!r}
     section = configobj.ConfigObj(["[p]", "type = {itype}", "enabled = yes"])["p"]
-    with mock.patch.object(RNS.Reticulum, "transport_enabled", staticmethod(lambda: False)):
+    # Interface.__init__ reads its defaults from the running instance.
+    with mock.patch.object(RNS.Reticulum, "transport_enabled", staticmethod(lambda: False)), \
+         mock.patch.object(RNS.Reticulum, "get_instance", staticmethod(lambda: me)):
         RNS.Reticulum._synthesize_interface(me, section, "p")
     print("SURVIVED", flush=True)
     {after}
@@ -55,6 +57,35 @@ PLUGINS = {
             def __init__(self, owner, configuration):
                 sys.exit(3)
         interface_class = ExitInInit
+    """,
+    # Review 2026-10-10 F1: interface_post_init REGISTERS the interface
+    # (Transport.add_interface) BEFORE final_init(), so a panic there used to
+    # leave a dead interface registered while the log said "Continuing
+    # without it" (rnstatus lists it; path requests are forwarded to it).
+    "PanicInFinalInit": """
+        class PanicInFinalInit(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+            def final_init(self):
+                RNS.panic()
+            def detach(self):
+                print("DETACHED", flush=True)
+        interface_class = PanicInFinalInit
+    """,
+    # Review 2026-10-10 F2: a plugin's OWN `except Exception` must not turn a
+    # panic into a healthy load (before the fork the process exited; a panic
+    # that is caught and ignored would load the interface, logging nothing).
+    "SwallowPanic": """
+        class SwallowPanic(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+                try:
+                    RNS.panic()
+                except Exception:
+                    pass
+        interface_class = SwallowPanic
     """,
     # control: an ordinary import error was ALREADY contained upstream
     "RaiseAtImport": """
@@ -95,6 +126,23 @@ class MeshForgeExternalInterfacePanicTest(unittest.TestCase):
 
     def test_ordinary_import_error_still_contained(self):
         self._assert_contained("RaiseAtImport")
+
+    def test_panic_in_final_init_leaves_nothing_registered(self):
+        r = _run("PanicInFinalInit",
+                 after='print("REGISTERED", len(RNS.Transport.interfaces), flush=True)')
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("refused", out, out)
+        self.assertIn("REGISTERED 0", r.stdout, out)   # not a zombie
+        self.assertIn("DETACHED", r.stdout, out)       # its resources released
+
+    def test_plugin_catch_all_cannot_swallow_a_panic(self):
+        r = _run("SwallowPanic",
+                 after='print("REGISTERED", len(RNS.Transport.interfaces), flush=True)')
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("refused", out, out)
+        self.assertIn("REGISTERED 0", r.stdout, out)
 
     def test_panic_outside_external_loading_still_exits(self):
         r = _run("NoSuchInterface", after="RNS.panic()")

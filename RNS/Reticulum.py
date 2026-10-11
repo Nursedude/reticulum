@@ -1099,7 +1099,16 @@ class Reticulum:
                                     interface = interface_class(RNS.Transport, interface_config)
                                     interface_post_init(interface)
 
-                        except (Exception, SystemExit) as e:
+                        except (Exception, SystemExit, RNS.ExternalInterfacePanic) as e:
+                            # interface_post_init registers the interface
+                            # BEFORE final_init(): a failure there must not
+                            # leave a dead interface in Transport while the
+                            # log says it is gone (review 2026-10-10 F1).
+                            if interface is not None:
+                                RNS.Transport.remove_interface(interface)
+                                try: interface.detach()
+                                except Exception as de:
+                                    RNS.log(f"Detaching refused interface {interface_type} / {name} failed: {de}", RNS.LOG_ERROR)
                             interface = None
                             if isinstance(e, RNS.ExternalInterfacePanic):
                                 RNS.log(f"External interface {interface_type} / {name} refused: it called RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
