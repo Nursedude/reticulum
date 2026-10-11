@@ -29,9 +29,14 @@ CHILD = textwrap.dedent("""
     # drain stdin forever, write nothing back; argv "slow" = drain 200 B per
     # 100 ms (a LoRa-rate consumer that is alive but behind)
     slow = "slow" in sys.argv[1:]
+    rate = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[1] == "rate" else None
     fd = sys.stdin.fileno()
     while True:
-        if slow:
+        if rate:
+            d = os.read(fd, max(200, int(rate * 0.02)))
+            if not d: break
+            time.sleep(len(d) / rate)
+        elif slow:
             if not os.read(fd, 200): break
             time.sleep(0.1)
         elif not os.read(fd, 4096):
@@ -68,6 +73,37 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         except Exception: pass
         for p in self.patches: p.stop()
         self.tmp.cleanup()
+
+    def _swap_iface(self, cfg):
+        """Replace the fixture's interface with one built from cfg; retire
+        BOTH at cleanup (writer threads exit only on detach or a generation
+        change, and test_child_crash_respawn_stays_online counts them)."""
+        def retire(i):
+            i.detached = True
+            try: i.process.kill()
+            except Exception: pass
+            if i._writer is not None: i._writer.join(2)
+        orig = self.iface
+        new = PI.PipeInterface(self.owner, cfg)
+        self.addCleanup(retire, new)
+        self.addCleanup(retire, orig)
+        self.iface = new
+        return new
+
+    def _spy_congestion(self):
+        """Record every entry into congested mode by the code itself — a
+        polling watcher thread is starved by the very contention under test
+        (fresh pass on a67be362) and undercounts."""
+        entered = []
+        class Spy(type(self.iface)):
+            @property
+            def _tx_congested(self): return self.__dict__.get("_spy_c", False)
+            @_tx_congested.setter
+            def _tx_congested(self, v):
+                if v and not self.__dict__.get("_spy_c", False): entered.append(time.monotonic())
+                self.__dict__["_spy_c"] = v
+        self.iface.__class__ = Spy
+        return entered
 
     def _send_many(self, n, size=1000, budget_s=10.0):
         """Send n frames from a worker; return (finished_in_budget, max_call_s)."""
@@ -168,15 +204,10 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         frame past its drain rate paid TX_PUT_WAIT_S on that reader: 100 f/s
         x 20 ms saturated it, and control traffic on the arriving TCP
         interface (never touching the pipe) ran 8 s median / 20 s worst.
-        Once a put has timed out with the writer blocked in a write for
-        TX_CONGEST_WRITE_S (the child is behind, not the writer unscheduled),
-        the next frames must not wait again until the queue has drained to
-        TX_LOW_WATER: a caller pays at most ~TX_CONGEST_WRITE_S per episode."""
-        slow = PI.PipeInterface(self.owner, {"name": "slow", "command": self.cfg["command"] + " slow"})
-        orig = self.iface
-        self.addCleanup(lambda: slow.process.kill())
-        self.addCleanup(lambda: orig.process.kill())
-        self.iface = slow  # every reference below is to the slow child's interface
+        Once a put has timed out with the kernel pipe FULL (the child is
+        behind, not the writer unscheduled), the next frames must not wait
+        again until the queue has drained to TX_LOW_WATER."""
+        self._swap_iface({"name": "slow", "command": self.cfg["command"] + " slow"})
         # Isolate the caller cost from the stall detector: never go offline here.
         with mock.patch.object(PI.PipeInterface, "TX_STALL_S", 3600.0):
             deadline = time.monotonic() + 20
@@ -189,10 +220,7 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
                 total += dt
                 if dt >= 0.015: slow_calls += 1
             self.assertTrue(self.iface.online, "went offline; the measurement would be vacuous")
-        congest_s = getattr(PI.PipeInterface, "TX_CONGEST_WRITE_S", 0.1)  # absent before mf.7: same budget
-        budget = int(congest_s / PI.PipeInterface.TX_PUT_WAIT_S) + 1
-        self.assertLessEqual(slow_calls, budget, f"{slow_calls} of 100 calls waited for a slot ({total:.2f}s on the caller)")
-        self.assertLess(total, congest_s + 0.1, f"{total:.2f}s spent on the caller")
+        self.assertLessEqual(slow_calls, 2, f"{slow_calls} of 100 calls waited for a slot ({total:.2f}s on the caller)")
 
     def test_stall_recovery_waits_for_the_queue_to_drain_to_low_water(self):
         """Same drill: a child draining 2 kB/s on a 16 KB-page kernel frees a
@@ -222,6 +250,32 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
                              f"came back online with {at_flip[0]} frames still queued")
 
 
+    def _contend(self, senders, burners, hogs, frames=500):
+        """Healthy (fast-draining) child; `senders` threads offer `frames`
+        each while `burners` run bytecode loops and `hogs` make long C calls
+        that hold the GIL (~75 ms each on a Pi 5)."""
+        entered = self._spy_congestion()
+        stop = threading.Event()
+        def burn():
+            x = 0
+            while not stop.is_set():
+                for _ in range(100000): x += 1
+        def hog():
+            while not stop.is_set(): sum(range(3000000))
+        def send():
+            for _ in range(frames): self.iface.process_outgoing(b"x" * 1000)
+        aux = [threading.Thread(target=burn, daemon=True) for _ in range(burners)] + \
+              [threading.Thread(target=hog, daemon=True) for _ in range(hogs)]
+        for t in aux: t.start()
+        ss = [threading.Thread(target=send, daemon=True) for _ in range(senders)]
+        try:
+            for t in ss: t.start()
+            for t in ss: t.join(90)
+        finally:
+            stop.set()
+        self.assertFalse(any(t.is_alive() for t in ss), "senders did not finish")
+        return entered
+
     def test_healthy_child_under_gil_contention_keeps_back_pressure(self):
         """Fresh pass on 94cd084d, F1: one 20 ms put timeout caused by the
         WRITER being starved of the GIL (child healthy) entered congested
@@ -229,29 +283,45 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         senders + 1 CPU-burning thread dropped 1242-1739 of 2000 where
         1.3.8+mf.6 dropped 67-117. Congestion is for a child that is behind,
         not for a writer that has not been scheduled."""
-        stop = threading.Event(); entered = []
-        def burn():
-            x = 0
-            while not stop.is_set():
-                for _ in range(100000): x += 1
-        def watch():
-            while not stop.is_set():
-                if self.iface._tx_congested: entered.append(1); return
-                time.sleep(0.0005)
-        def send():
-            for _ in range(500): self.iface.process_outgoing(b"x" * 1000)
-        aux = [threading.Thread(target=burn, daemon=True), threading.Thread(target=watch, daemon=True)]
-        for t in aux: t.start()
-        senders = [threading.Thread(target=send, daemon=True) for _ in range(4)]
-        try:
-            for t in senders: t.start()
-            for t in senders: t.join(60)
-        finally:
-            stop.set()
-        self.assertFalse(any(t.is_alive() for t in senders), "senders did not finish")
+        entered = self._contend(senders=4, burners=1, hogs=0)
         self.assertEqual(entered, [], "entered congested mode with a child that was draining")
         self.assertLess(self.iface.tx_dropped, 500, f"{self.iface.tx_dropped} of 2000 dropped with a healthy child")
         self.assertTrue(self.iface.online)
+
+    def test_healthy_child_under_long_gil_holds_never_congests(self):
+        """Fresh pass on a67be362, F2: a clock-based gate (writer inside a
+        write >= 0.1 s) also counts the GIL re-acquire after the syscall, so
+        long C calls on other threads (4 senders + 1 burner + 2 GIL hogs)
+        still entered congestion with a healthy child: 1739 of 2000 dropped
+        vs 207 on 1.3.8+mf.6, with the pipe WRITABLE when sampled. The
+        evidence must be the kernel's: a full pipe."""
+        entered = self._contend(senders=4, burners=1, hogs=2, frames=250)
+        self.assertEqual(entered, [], "entered congested mode with a child that was draining")
+        self.assertTrue(self.iface.online)
+
+    def test_child_behind_at_a_fast_rate_still_congests(self):
+        """Fresh pass on a67be362, F1: the kernel wakes a pipe writer only
+        when a whole PAGE has been consumed, so a child draining 200 kB/s
+        (16 KB pages: a block every ~80 ms) never blocked one write for
+        0.1 s; offered 300 kB/s it was BEHIND (this test offers 600 kB/s so
+        the 256 KB pipe + 256-frame queue fill within its 5 s), never congested, and every
+        frame paid TX_PUT_WAIT_S on the caller again (496 waits in 15 s,
+        caller busy 100% — the mf.6 reader-saturation shape). On a 4 KB-page
+        kernel that band starts near 41 kB/s."""
+        self._swap_iface({"name": "fast", "command": self.cfg["command"] + " rate 200000"})
+        entered = self._spy_congestion()
+        waits = 0; busy = 0.0
+        t_end = time.monotonic() + 5.0; k = 0; t0 = time.monotonic()
+        while time.monotonic() < t_end:
+            k += 1
+            t = time.monotonic(); self.iface.process_outgoing(b"f" * 1000); dt = time.monotonic() - t
+            busy += dt
+            if dt >= 0.015: waits += 1
+            nxt = t0 + k / 600.0
+            if nxt > time.monotonic(): time.sleep(nxt - time.monotonic())
+        self.assertGreater(self.iface.tx_dropped, 0, "the child was never behind; the shape is vacuous")
+        self.assertNotEqual(entered, [], "a child that was behind never entered congested mode")
+        self.assertLessEqual(waits, 5, f"{waits} calls waited for a slot ({busy:.2f}s of 5s on the caller)")
 
 
 if __name__ == "__main__":

@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### `1.3.8+mf.7` (UNRELEASED) — a slow PipeInterface child costs a forwarding reader one wait per congestion episode, and stops flapping
+### `1.3.8+mf.7` (UNRELEASED) — a PipeInterface child that is behind costs a forwarding reader one wait per congestion episode, and stops flapping
 
 Transport-forwarding drill 2026-10-10 (three private instances: TCP client →
 router with `enable_transport = Yes` → PipeInterface → relay child → TCP →
@@ -118,32 +118,53 @@ every ~8 s: on a 16 KB-page kernel the writer gets room only when the child
 has consumed a whole page (16 KB ÷ 2 kB/s > `TX_STALL_S`), and the first
 completed write flipped it back with the queue still full. A SIGSTOPped
 child was fine (1.23 s worst, ×2); stock was worse in every shape (rnsd's
-own announcing thread froze). Cure: a put that times out while the writer
-has been blocked INSIDE a write for `TX_CONGEST_WRITE_S` (0.1 s — the pipe
-is full, so the child is behind) makes the interface CONGESTED — frames are
-offered with `put_nowait` (dropped and counted only if the queue is full)
-until the queue has drained to `TX_LOW_WATER` (`TX_QUEUE_DEPTH // 2` = 128),
-so each caller thread pays at most ~`TX_CONGEST_WRITE_S` of waits per
-episode. Congested mode has NO back-pressure, which is why it needs that
-evidence: in the first cut (`94cd084d`) any timeout entered it, and a
-HEALTHY child whose writer had merely not been scheduled (4 senders + 1
-CPU-burning thread) dropped 1242–1739 of 2000 frames where `1.3.8+mf.6`
-dropped 67–117 (fresh pass F1). With the write-blocked gate the same shape
-drops what mf.6 drops (27–61 vs 44–64, 0 congestion episodes), and a
-healthy-child burst keeps mf.6's back-pressure. The same low-water mark
-gates recovery from a stall: the interface comes back Up when a write
-completes AND the queue is at or below `TX_LOW_WATER`, so a slow child no
-longer flaps on every page — at the price of a longer Down: time-to-Up
-after a stall is about `TX_LOW_WATER` frames ÷ the child's drain rate
-(~128 KB of 1 KB frames: about a minute at 2 kB/s, longer at LoRa rates),
-while bytes delivered are unchanged (fresh pass F2). Not changed: stall detection (still the
-drop path, still `TX_STALL_S` from the last completed write), queue depth,
-respawn. Tests (in `tests/meshforge_pipe_interface_stall.py`, red on
-`5f9d0553` = `1.3.8+mf.6` code): a child started with `slow` (200 B per
-100 ms) — 100 of 100 calls waited for a slot (2.01 s on the caller), now ≤ `TX_CONGEST_WRITE_S ÷ TX_PUT_WAIT_S` + 1;
-SIGSTOP → offline → SIGCONT — Up with 256 frames still queued, now ≤ 128;
-4 senders + a CPU-burning thread on a HEALTHY child must never enter
-congested mode (red on `94cd084d`).
+own announcing thread froze). Cure: a put that times out while the KERNEL
+reports the pipe full (`select()` says not writable — the child is behind)
+makes the interface CONGESTED — frames are offered with `put_nowait`
+(dropped and counted only if the queue is full) until the queue has drained
+to `TX_LOW_WATER` (`TX_QUEUE_DEPTH // 2` = 128), so a caller pays one wait
+per episode (measured: 1 wait ≥ 15 ms per 15 s run at every drain rate from
+2 kB/s to 300 kB/s; caller busy ≤ 0.6 % mean). Congested mode has NO
+back-pressure, which is why the evidence has to be the kernel's. Two cuts
+used weaker evidence and each fresh pass broke it: `94cd084d` congested on
+ANY timeout, so a HEALTHY child whose writer had merely not been scheduled
+(4 senders + 1 CPU-burning thread) dropped 1242–1739 of 2000 where
+`1.3.8+mf.6` dropped 67–117; `a67be362` congested when the writer had sat in
+one write call for 0.1 s, which (a) also counts the GIL re-acquire after the
+syscall, so long GIL holds on other threads still congested a healthy child
+(1741 of 2000 dropped vs 116), with the pipe writable when sampled, and (b)
+missed a child behind at a FAST rate: the kernel wakes a pipe writer only
+per consumed PAGE, so a 200 kB/s child on 16 KB pages blocks ~80 ms per
+write and never qualified — every frame paid `TX_PUT_WAIT_S` again (496
+waits / 15 s, caller busy 67 %; on a 4 KB-page kernel that band would start
+near 41 kB/s). With the pipe-full check a healthy child never congests (0
+episodes in every contention shape tried, drops within mf.6's own
+run-to-run spread: 8 senders + 2 burners, three interleaved pairs, mf.6
+907–1530 vs 345–1045) and keeps mf.6's back-pressure exactly (with no
+episode the code path is mf.6's plus one non-blocking `select` per
+timed-out put). The trade, stated: once a child is behind, the excess is
+dropped at the pipe instead of stalling the reader that offered it — at
+200 kB/s drained / 300 kB/s offered, 1016 frames dropped in 15 s vs 374
+when the reader was held back (and every other frame on that reader with
+it). The same low-water mark gates recovery from a stall: the interface
+comes back Up when a write completes AND the queue is at or below
+`TX_LOW_WATER`, so a slow child no longer flaps on every page — at the
+price of a longer Down: time-to-Up after a stall is about `TX_LOW_WATER`
+frames ÷ the child's drain rate (~128 KB of 1 KB frames: measured 72 s at
+2 kB/s, longer at LoRa rates), while bytes delivered are unchanged (fresh
+pass F2). If `select()` itself fails the pipe reads as NOT full — without
+evidence the interface keeps mf.6 back-pressure. Not changed: stall
+detection (still the drop path, still `TX_STALL_S` from the last completed
+write), queue depth, respawn. Tests (in
+`tests/meshforge_pipe_interface_stall.py`; congestion entry is recorded by a
+property spy, because a polling watcher thread is starved by the very
+contention under test): a child started with `slow` (200 B per 100 ms) —
+100 of 100 calls waited (2.01 s on the caller) on `5f9d0553` (= mf.6 code),
+now ≤ 2; SIGSTOP → offline → SIGCONT — Up with 256 frames still queued on
+mf.6, now ≤ 128; a HEALTHY child under 4 senders + 1 CPU burner (red on
+`94cd084d`) and under 4 senders + 1 burner + 2 GIL hogs (red on `a67be362`)
+must never enter congested mode; a child draining 200 kB/s offered
+600 kB/s must enter it and cost the caller ≤ 5 waits (red on `a67be362`).
 No wire or crypto change.
 
 ### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd

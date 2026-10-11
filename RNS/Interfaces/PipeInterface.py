@@ -38,6 +38,7 @@ import RNS
 import subprocess
 import shlex
 import queue
+import select
 
 class HDLC():
     # The Pipe Interface packetizes data using
@@ -86,12 +87,14 @@ class PipeInterface(Interface):
     # does not flap Down/Up on every page.
     TX_LOW_WATER = TX_QUEUE_DEPTH // 2
     # A put timeout is evidence of a child that is BEHIND only when the
-    # writer is blocked inside a write the kernel will not complete (pipe
-    # full). A timeout while the writer is merely waiting for the GIL is a
-    # healthy child under CPU contention: entering congestion there removed
-    # the back-pressure and dropped frames 1.3.8+mf.6 took (fresh pass F1 on
-    # 94cd084d: 4 senders + 1 CPU burner, 1242-1739 of 2000 vs 67-117).
-    TX_CONGEST_WRITE_S = 0.1
+    # kernel says so: the pipe is not writable (full). A clock on the
+    # writer's write call is the wrong quantity twice over (fresh pass on
+    # a67be362): it also counts the GIL re-acquire after the syscall, so a
+    # HEALTHY child under long GIL holds still congested (1739 of 2000
+    # dropped vs 207 on mf.6, pipe writable when sampled); and the kernel
+    # wakes a pipe writer per consumed PAGE, so a child behind at a fast
+    # rate (200 kB/s on 16 KB pages, ~41 kB/s on 4 KB pages) never blocked
+    # long enough and every frame paid TX_PUT_WAIT_S again.
 
     owner    = None
     command  = None
@@ -126,7 +129,6 @@ class PipeInterface(Interface):
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
         self._tx_congested = False
-        self._tx_write_started = None
         self._writer_gen = 0
         self._writer = None
 
@@ -169,7 +171,6 @@ class PipeInterface(Interface):
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
         self._tx_congested = False
-        self._tx_write_started = None
         self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
                                         name=f"pipe-writer-{self.name}")
         self._writer.start()
@@ -191,14 +192,21 @@ class PipeInterface(Interface):
                 if self._tx_congested: self._txq.put_nowait(data)
                 else: self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
             except queue.Full:
-                started = self._tx_write_started
-                if started is not None and time.monotonic() - started >= PipeInterface.TX_CONGEST_WRITE_S:
-                    self._tx_congested = True
+                if self._pipe_full(): self._tx_congested = True
                 self.tx_dropped += 1
                 self._check_tx_stall()
         elif self._tx_stalled:
             # Offered while stalled: counted, so the recovery line is honest.
             self.tx_dropped += 1
+
+    def _pipe_full(self):
+        # The kernel's own fact, one non-blocking syscall per timed-out put
+        # (which already cost TX_PUT_WAIT_S). Unobservable reads as NOT
+        # full: without evidence the interface keeps mf.6 back-pressure.
+        try:
+            return not select.select([], [self.process.stdin], [], 0)[1]
+        except Exception:
+            return False
 
     def _check_tx_stall(self):
         # Called when the queue is full: the writer is wedged in a write the
@@ -223,7 +231,6 @@ class PipeInterface(Interface):
                 except queue.Full: pass
                 return
             try:
-                if gen == self._writer_gen: self._tx_write_started = time.monotonic()
                 written = process.stdin.write(data)
                 process.stdin.flush()
             except Exception as e:
@@ -231,8 +238,6 @@ class PipeInterface(Interface):
                 if gen == self._writer_gen:
                     self.online = False
                 return
-            finally:
-                if gen == self._writer_gen: self._tx_write_started = None
             self.txb += len(data)
             self._tx_last_drain = time.monotonic()
             if written != len(data):
