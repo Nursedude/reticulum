@@ -1095,6 +1095,11 @@ class Reticulum:
                             with open(interface_path) as class_file:
                                 interface_code = class_file.read()
                                 exec(interface_code, interface_globals)
+                                # Swallowed at import time: refuse before the
+                                # constructor opens ports or starts threads
+                                # (fourth review F3).
+                                if guard.panicked:
+                                    raise RNS.ExternalInterfacePanic("the interface swallowed an RNS.panic() while loading")
                                 interface_class = interface_globals["interface_class"]
 
                                 if interface_class != None:
@@ -1137,10 +1142,17 @@ class Reticulum:
                                 if dt.is_alive():
                                     RNS.log(f"Refused interface {interface_type} / {name} did not finish detaching within {RNS.Transport.DETACH_TIMEOUT}s; continuing without waiting", RNS.LOG_WARNING)
                             interface = None
-                            if isinstance(e, RNS.ExternalInterfacePanic) and "swallowed" in str(e):
-                                RNS.log(f"External interface {interface_type} / {name} refused: it swallowed an RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
-                            elif isinstance(e, RNS.ExternalInterfacePanic):
+                            # Branch on the FLAG, not on which exception
+                            # reached us: a plugin that swallowed its panic
+                            # and then raised something ordinary (or never
+                            # defined interface_class) must still be logged
+                            # as a swallowed panic (fourth review F1).
+                            direct_panic = isinstance(e, RNS.ExternalInterfacePanic) and "swallowed" not in str(e)
+                            if direct_panic:
                                 RNS.log(f"External interface {interface_type} / {name} refused: it called RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
+                            elif guard.panicked:
+                                then = "" if isinstance(e, RNS.ExternalInterfacePanic) else f", then raised {type(e).__name__}"
+                                RNS.log(f"External interface {interface_type} / {name} refused: it swallowed an RNS.panic() while loading{then}. Continuing without it.", RNS.LOG_CRITICAL)
                             elif isinstance(e, SystemExit):
                                 RNS.log(f"External interface {interface_type} / {name} refused: it called sys.exit({e.code!r}) while loading. Continuing without it.", RNS.LOG_CRITICAL)
                             RNS.log(f"External interface initialisation failed for {interface_type} / {name}", RNS.LOG_ERROR)

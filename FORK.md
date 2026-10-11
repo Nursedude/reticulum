@@ -121,12 +121,19 @@ Scope, stated: LOAD time, on the loading thread, via `RNS.panic()` or
 (2026-10-10): a panic on a thread the plugin starts (during load or later),
 a runtime panic after the load, a direct `os._exit()`, and `RNS.exit()`.
 `RNS.exit()` at load time is worse than an exit, measured by drill (third
-review): it latches `exit_called`, then `Reticulum.exit_handler()` fails
-because `Transport.start()` has not run yet, so rnsd keeps running with
-SIGTERM turned into a no-op (still alive 6 s after SIGTERM; control exited).
-A systemd stop then ends in SIGKILL, with no path-table save. After
-`Transport.start()` (a Discovery re-synthesis) the same call is `os._exit(0)`
-with no refusal logged. Not fixed; stated. A plugin that
+review): it latches `exit_called`, then `Reticulum.exit_handler()` calls
+`Transport.exit_handler()`, which sets `Transport._should_run = False` and
+THEN dies on `Transport.owner` (unset until `Transport.start()`). The
+exception reaches the loader's catch-all, so rnsd keeps running — but when
+`Transport.start()` then starts `jobloop`, the thread exits on its first
+`_should_run` check: rnsd is alive and JOBLESS (no path-table maintenance,
+no announce/retry jobs, no path-table save), and SIGTERM is a no-op (still
+alive 6 s after SIGTERM; control exited). A systemd stop then ends in
+SIGKILL. Identical on stock `c4f74c38` (fourth review, measured) — a
+pre-existing upstream shape, not introduced here. After `Transport.start()`
+(a Discovery re-synthesis) the same call is `os._exit(0)` with no refusal
+logged. Not fixed; stated. A plugin that raises its own `BaseException`
+subclass at load kills the process (stock too; stated). A plugin that
 holds a Transport lock across its panic leaves it held (contrived; stated).
 Review fixes (same entry, not yet tagged): `ExternalInterfacePanic` is a
 `BaseException`, so a plugin's own `except Exception` cannot swallow a panic
@@ -157,12 +164,22 @@ started keep running (and can still feed `Transport.inbound`) until its own
 sub-interface the plugin registered itself survives, and a `bootstrap_only`
 plugin's config stays in `bootstrap_configs`, so Discovery may re-synthesise
 it (and re-refuse it, CRITICAL each time) when no discovered interface is up.
-Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
-unpatched tree: rc 255 / rc 3; the two controls pass on both; the two review
-cases fail on `0f8f637f` with `REGISTERED 1`, pass after). Also fixed:
-`tests/meshforge_detach_timeout.py` parked non-daemon detach threads forever,
-so a one-process run of the `meshforge_*` files never exited (now released in
-`tearDown`; all pass and exit 0 — 60 in one process at this entry). Live drill
+Fourth review fixes (fresh non-author pass 2026-10-10): the refusal log
+branches on the recorded flag, not on which exception reached the loader,
+so a plugin that swallowed its panic and then raised something ordinary is
+logged `it swallowed an RNS.panic() while loading, then raised <Type>`, and
+one that swallowed it at import time without defining `interface_class` is
+logged as a swallowed panic rather than as the `KeyError` (F1); and the
+flag is also checked right after `exec`, so a panic swallowed at import
+time is refused BEFORE the constructor runs (F3).
+Test: `tests/meshforge_external_interface_panic.py` — 18 cases at this
+entry; on the unpatched `1.3.8+mf.4` tree 16 fail (17 failure records, the
+inf/nan subtests count twice; rc 255 / rc 3 / `REGISTERED 1` / missing
+witness) and the two controls pass on both trees — measured, not carried.
+Also fixed: `tests/meshforge_detach_timeout.py` parked non-daemon detach
+threads forever, so a one-process run of the `meshforge_*` files never
+exited (now released in `tearDown`; all pass and exit 0 — 63 in one process
+at this entry, `tests.all` 36 OK). Live drill
 2026-10-10 (real rnsd, private configdir, `share_instance = No`, TCP server
 iface + the SMCI-shaped plugin), run twice: patched alive, TCP listening and
 accepting, refusal logged; unpatched `1.3.8+mf.4` control exit 255, TCP never

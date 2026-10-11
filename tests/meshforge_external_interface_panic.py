@@ -161,6 +161,46 @@ PLUGINS = {
                 print("FINAL_INIT_RAN", flush=True)
         interface_class = SwallowThenFinalInit
     """,
+    # Fourth pass F1: a plugin that swallows its panic and THEN raises an
+    # ordinary error was refused, but logged only "initialisation failed" --
+    # the swallowed panic left no witness, so the operator read a broken
+    # plugin as a plain import error.
+    "SwallowThenRaise": """
+        class SwallowThenRaise(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+                try:
+                    RNS.panic()
+                except:
+                    pass
+                raise RuntimeError("after the swallow")
+        interface_class = SwallowThenRaise
+    """,
+    # Fourth pass F1 (second shape): a panic swallowed at IMPORT time by a
+    # module that never defines `interface_class` surfaced as the KeyError,
+    # never as a swallowed panic.
+    "SwallowAtImportNoClass": """
+        try:
+            RNS.panic()
+        except:
+            pass
+    """,
+    # Fourth pass F3: a panic swallowed at import time still CONSTRUCTED the
+    # plugin (ports, threads) before the refusal; the check belongs right
+    # after exec, before the constructor runs.
+    "SwallowAtImportThenConstruct": """
+        try:
+            RNS.panic()
+        except:
+            pass
+        class SwallowAtImportThenConstruct(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                print("CONSTRUCTED", flush=True)
+                super().__init__()
+        interface_class = SwallowAtImportThenConstruct
+    """,
     # control: an ordinary import error was ALREADY contained upstream
     "RaiseAtImport": """
         raise ImportError("No module named 'meshcore'")
@@ -256,6 +296,19 @@ class MeshForgeExternalInterfacePanicTest(unittest.TestCase):
         out = self._assert_refused_cleanly("SwallowThenFinalInit")
         self.assertIn("swallowed", out, out)
         self.assertNotIn("FINAL_INIT_RAN", out, out)   # never brought up
+
+    def test_swallow_then_ordinary_raise_is_logged_as_a_swallowed_panic(self):
+        out = self._assert_refused_cleanly("SwallowThenRaise")
+        self.assertIn("swallowed", out, out)
+
+    def test_swallow_at_import_without_interface_class_is_logged_as_a_swallowed_panic(self):
+        out = self._assert_refused_cleanly("SwallowAtImportNoClass")
+        self.assertIn("swallowed", out, out)
+
+    def test_swallowed_panic_at_import_is_refused_before_construction(self):
+        out = self._assert_refused_cleanly("SwallowAtImportThenConstruct")
+        self.assertIn("swallowed", out, out)
+        self.assertNotIn("CONSTRUCTED", out, out)   # never constructed
 
     def test_infinite_detach_timeout_does_not_turn_a_refusal_into_an_exit(self):
         for raw in ("inf", "nan"):
