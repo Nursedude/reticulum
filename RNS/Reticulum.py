@@ -1099,8 +1099,14 @@ class Reticulum:
 
                                 if interface_class != None:
                                     interface = interface_class(RNS.Transport, interface_config)
+                                    # Before post_init registers it and runs
+                                    # final_init(): a swallowed panic must not
+                                    # be brought up first (third review #1).
+                                    if guard.panicked:
+                                        raise RNS.ExternalInterfacePanic("the interface swallowed an RNS.panic() while loading")
                                     interface_post_init(interface)
 
+                            # Swallowed inside final_init(), or at import time.
                             if guard.panicked:
                                 raise RNS.ExternalInterfacePanic("the interface swallowed an RNS.panic() while loading")
 

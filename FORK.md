@@ -119,8 +119,14 @@ any other thread, or after the load, is still `os._exit(255)` (pinned).
 Scope, stated: LOAD time, on the loading thread, via `RNS.panic()` or
 `sys.exit()` only. NOT contained, each measured by the non-author review
 (2026-10-10): a panic on a thread the plugin starts (during load or later),
-a runtime panic after the load, a direct `os._exit()`, and `RNS.exit()`
-(which detaches EVERY interface, then exits — read, not run). A plugin that
+a runtime panic after the load, a direct `os._exit()`, and `RNS.exit()`.
+`RNS.exit()` at load time is worse than an exit, measured by drill (third
+review): it latches `exit_called`, then `Reticulum.exit_handler()` fails
+because `Transport.start()` has not run yet, so rnsd keeps running with
+SIGTERM turned into a no-op (still alive 6 s after SIGTERM; control exited).
+A systemd stop then ends in SIGKILL, with no path-table save. After
+`Transport.start()` (a Discovery re-synthesis) the same call is `os._exit(0)`
+with no refusal logged. Not fixed; stated. A plugin that
 holds a Transport lock across its panic leaves it held (contrived; stated).
 Review fixes (same entry, not yet tagged): `ExternalInterfacePanic` is a
 `BaseException`, so a plugin's own `except Exception` cannot swallow a panic
@@ -140,7 +146,11 @@ unparseable fall back to 5 s with a WARNING at `Transport.start()` (inf/nan
 used to raise inside the refusal handler and exit 255; an unparseable value
 raised at `import RNS` for every program) (F3); and `RNS.panic()` records
 that it was called, so a plugin whose BARE `except:` swallows the raise is
-still refused, logged `it swallowed an RNS.panic()` (F4).
+still refused, logged `it swallowed an RNS.panic()` (F4). The check runs
+right after construction, BEFORE `interface_post_init` registers the
+interface and runs `final_init()` (third review), and again after it, for a
+panic swallowed inside `final_init()`. The `RNS_DETACH_TIMEOUT` WARNING is
+logged once `Transport.start()` runs, i.e. after the interfaces have loaded.
 "Refused" means unregistered from Transport, NOT inert: threads the plugin
 started keep running (and can still feed `Transport.inbound`) until its own
 `detach()` stops them, and the loader removes only what IT registered — a
@@ -152,7 +162,7 @@ unpatched tree: rc 255 / rc 3; the two controls pass on both; the two review
 cases fail on `0f8f637f` with `REGISTERED 1`, pass after). Also fixed:
 `tests/meshforge_detach_timeout.py` parked non-daemon detach threads forever,
 so a one-process run of the `meshforge_*` files never exited (now released in
-`tearDown`; all 52 pass and exit 0). Live drill
+`tearDown`; all pass and exit 0 — 60 in one process at this entry). Live drill
 2026-10-10 (real rnsd, private configdir, `share_instance = No`, TCP server
 iface + the SMCI-shaped plugin), run twice: patched alive, TCP listening and
 accepting, refusal logged; unpatched `1.3.8+mf.4` control exit 255, TCP never

@@ -144,6 +144,23 @@ PLUGINS = {
                     pass
         interface_class = BareExceptSwallow
     """,
+    # Review 2026-10-10 (third pass) #1: the swallowed-panic check ran AFTER
+    # interface_post_init, so a plugin that swallowed its panic in __init__
+    # was registered and had final_init() (threads, ports) RUN before the
+    # refusal, relying on the broken plugin's own detach() to undo it.
+    "SwallowThenFinalInit": """
+        class SwallowThenFinalInit(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+                try:
+                    RNS.panic()
+                except:
+                    pass
+            def final_init(self):
+                print("FINAL_INIT_RAN", flush=True)
+        interface_class = SwallowThenFinalInit
+    """,
     # control: an ordinary import error was ALREADY contained upstream
     "RaiseAtImport": """
         raise ImportError("No module named 'meshcore'")
@@ -234,6 +251,11 @@ class MeshForgeExternalInterfacePanicTest(unittest.TestCase):
     def test_plugin_bare_except_cannot_swallow_a_panic(self):
         out = self._assert_refused_cleanly("BareExceptSwallow")
         self.assertIn("swallowed", out, out)
+
+    def test_swallowed_panic_in_init_is_refused_before_registration(self):
+        out = self._assert_refused_cleanly("SwallowThenFinalInit")
+        self.assertIn("swallowed", out, out)
+        self.assertNotIn("FINAL_INIT_RAN", out, out)   # never brought up
 
     def test_infinite_detach_timeout_does_not_turn_a_refusal_into_an_exit(self):
         for raw in ("inf", "nan"):
