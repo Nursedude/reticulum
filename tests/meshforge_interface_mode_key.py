@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest import mock
 
-import configobj
+from RNS.vendor import configobj
 
 import RNS
 from RNS.Interfaces.Interface import Interface

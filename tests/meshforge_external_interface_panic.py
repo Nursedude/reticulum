@@ -23,7 +23,7 @@ CHILD = textwrap.dedent("""
     import sys
     sys.path.insert(0, {repo!r})
     from unittest import mock
-    import configobj
+    from RNS.vendor import configobj
     import RNS
     assert RNS.__file__.startswith({repo!r}), RNS.__file__
     RNS.loglevel = RNS.LOG_DEBUG
