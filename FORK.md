@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### UNRELEASED (2026-10-10) — an external interface that panics while loading costs that interface, not rnsd
+### `1.3.8+mf.5` (2026-10-10) — an external interface that panics while loading costs that interface, not rnsd
 
 Upstream wraps the exec + constructor of a user-supplied `interfaces/*.py`
 module in `except Exception`. That contains an ordinary error, but not
@@ -123,7 +123,12 @@ a runtime panic after the load, a direct `os._exit()`, and `RNS.exit()`.
 `RNS.exit()` at load time is worse than an exit, measured by drill (third
 review): it latches `exit_called`, then `Reticulum.exit_handler()` calls
 `Transport.exit_handler()`, which sets `Transport._should_run = False` and
-THEN dies on `Transport.owner` (unset until `Transport.start()`). The
+THEN dies on `Transport.owner` (unset until `Transport.start()`). Before
+that failure `Reticulum.exit_handler()` has already run
+`Transport.detach_interfaces()`, so every interface loaded EARLIER in the
+config is detached yet still listed in `Transport.interfaces`, and
+`Identity.exit_handler()` is never reached (fifth review, measured on this
+tree and on stock; `count_traffic_loop` survives, only `jobloop` dies). The
 exception reaches the loader's catch-all, so rnsd keeps running — but when
 `Transport.start()` then starts `jobloop`, the thread exits on its first
 `_should_run` check: rnsd is alive and JOBLESS (no path-table maintenance,
