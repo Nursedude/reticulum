@@ -37,6 +37,7 @@ import RNS
 
 import subprocess
 import shlex
+import queue
 
 class HDLC():
     # The Pipe Interface packetizes data using
@@ -55,6 +56,17 @@ class PipeInterface(Interface):
     MAX_CHUNK = 32768
     BITRATE_GUESS = 1*1000*1000
     DEFAULT_IFAC_SIZE = 8
+
+    # MeshForge fork: outbound frames go through a bounded queue drained by a
+    # writer thread, never a blocking stdin.write() on the caller's thread
+    # (Transport.transmit). A child that stops draining costs THIS interface:
+    # after TX_STALL_S without a completed write the interface reads offline
+    # (rnstatus: Down), frames are dropped and counted, and it comes back
+    # the moment the child drains again. Bench drill 2026-10-10: stock blocked
+    # the sending thread 47 s on a SIGSTOPped child, every other interface on
+    # that thread starved, `online` True throughout.
+    TX_QUEUE_DEPTH = 64
+    TX_STALL_S = 5.0
 
     owner    = None
     command  = None
@@ -84,6 +96,11 @@ class PipeInterface(Interface):
         self.pipe_is_open = False
         self.bitrate  = PipeInterface.BITRATE_GUESS
         self.respawn_delay = respawn_delay
+        self.tx_dropped = 0
+        self._txq = queue.Queue(maxsize=PipeInterface.TX_QUEUE_DEPTH)
+        self._tx_last_drain = time.monotonic()
+        self._tx_stalled = False
+        self._writer_gen = 0
 
         try:
             self.open_pipe()
@@ -114,6 +131,12 @@ class PipeInterface(Interface):
         thread = threading.Thread(target=self.readLoop)
         thread.daemon = True
         thread.start()
+        self._writer_gen += 1
+        self._tx_last_drain = time.monotonic()
+        self._tx_stalled = False
+        writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
+                                  name=f"pipe-writer-{self.name}")
+        writer.start()
         self.online = True
         RNS.log("Subprocess pipe for "+str(self)+" is now connected", RNS.LOG_VERBOSE)
 
@@ -126,11 +149,43 @@ class PipeInterface(Interface):
     def process_outgoing(self,data):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-            written = self.process.stdin.write(data)
-            self.process.stdin.flush()
-            self.txb += len(data)            
+            try:
+                self._txq.put_nowait(data)
+            except queue.Full:
+                self.tx_dropped += 1
+                self._check_tx_stall()
+
+    def _check_tx_stall(self):
+        # Called when the queue is full: the writer is wedged in a write the
+        # child is not draining. Measured, not assumed — the clock starts at
+        # the last COMPLETED write.
+        stalled_for = time.monotonic() - self._tx_last_drain
+        if not self._tx_stalled and stalled_for >= PipeInterface.TX_STALL_S:
+            self._tx_stalled = True
+            self.online = False
+            RNS.log(f"{self} subprocess has not drained its stdin for {stalled_for:.1f}s; interface is now offline, {self.tx_dropped} frame(s) dropped so far", RNS.LOG_WARNING)
+
+    def _write_loop(self, gen, process):
+        while gen == self._writer_gen and not self.detached:
+            try:
+                data = self._txq.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                written = process.stdin.write(data)
+                process.stdin.flush()
+            except Exception as e:
+                RNS.log(f"{self} write to subprocess failed: {e}", RNS.LOG_ERROR)
+                self.online = False
+                return
+            self.txb += len(data)
+            self._tx_last_drain = time.monotonic()
             if written != len(data):
-                raise IOError("Pipe interface only wrote "+str(written)+" bytes of "+str(len(data)))
+                RNS.log("Pipe interface only wrote "+str(written)+" bytes of "+str(len(data)), RNS.LOG_ERROR)
+            if self._tx_stalled and gen == self._writer_gen and self.pipe_is_open and not self.detached:
+                self._tx_stalled = False
+                self.online = True
+                RNS.log(f"{self} subprocess is draining again; interface is back online ({self.tx_dropped} frame(s) dropped during the stall)", RNS.LOG_WARNING)
 
 
     def readLoop(self):

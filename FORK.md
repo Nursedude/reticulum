@@ -102,6 +102,35 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### UNRELEASED (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
+
+Stock `PipeInterface.process_outgoing()` does a blocking `stdin.write()` on
+the CALLER's thread (`Transport.transmit` ← `outbound` ← `Packet.send`). Once
+the kernel pipe is full (64 KB on 4 KB-page kernels, 256 KB on the Pi 5's
+16 KB pages — read it with `F_GETPIPE_SZ`, never assume) a stalled child
+blocks that thread for as long as it stays stalled; bench drill 2026-10-10
+(private rnsd, `share_instance = No`, child SIGSTOPped 60 s under ~20 kB/s):
+sending thread blocked 47 s at `PipeInterface.py:130`, the TCP interface's
+traffic went 20 kB/s → 0 on the same thread, `online` stayed True. Cure:
+outbound frames go through a bounded queue (`TX_QUEUE_DEPTH` = 64) drained
+by one writer thread per spawned child; when the queue is full the frame is
+dropped and counted (`tx_dropped`), and if no write has COMPLETED for
+`TX_STALL_S` (5 s) the interface goes `online = False` (rnstatus: Down,
+`process_outgoing` drops) with a WARNING naming the stall and the drop
+count; the first completed write after that flips it back with a second
+WARNING. Detection latency is pipe capacity ÷ offered rate + `TX_STALL_S`:
+the interface can only see a write complete, not the child consume, and
+the check runs on the DROP path (no timer): a stalled child with no
+offered traffic reads online until the next frame is offered. Not
+changed: the read loop, HDLC framing, respawn on child exit, the
+`panic_on_interface_error` path. Scope, stated: a child that stops
+draining; a child that drains but never answers is still invisible here
+(`last_read_ms` is computed and unused, as upstream). Test:
+`tests/meshforge_pipe_interface_stall.py` — three cases with a real
+SIGSTOPped subprocess; on `1.3.8+mf.5` the caller-blocks case FAILS (8 s
+budget) and the offline case ERRORS (no `TX_STALL_S`); the healthy-child
+control passes on both. No wire or crypto change.
+
 ### `1.3.8+mf.5` (2026-10-10) — an external interface that panics while loading costs that interface, not rnsd
 
 Upstream wraps the exec + constructor of a user-supplied `interfaces/*.py`
