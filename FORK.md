@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### UNRELEASED (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
+### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
 
 Stock `PipeInterface.process_outgoing()` does a blocking `stdin.write()` on
 the CALLER's thread (`Transport.transmit` ← `outbound` ← `Packet.send`). Once
@@ -122,12 +122,16 @@ the dead pipe and marked the LIVE respawned interface offline, 18/20);
 (fresh pass F2: a 64-deep queue with no wait dropped 436 of a 500-frame burst
 that stock's 256 KB pipe absorbed; now a 2000-frame burst drops 0); only
 then is the frame dropped and counted (`tx_dropped`, which also counts frames
-offered while offline so the recovery line is honest), and if no write has COMPLETED for
+offered while STALL-offline so the recovery line is honest; frames offered
+while crash/respawn-offline are not counted, as in stock), and if no write has COMPLETED for
 `TX_STALL_S` (5 s) the interface goes `online = False` (rnstatus: Down,
 `process_outgoing` drops) with a WARNING naming the stall and the drop
 count; the first completed write after that flips it back with a second
-WARNING. Detection latency is pipe capacity ÷ offered rate + `TX_STALL_S`:
-the interface can only see a write complete, not the child consume, and
+WARNING. Detection latency is pipe capacity ÷ offered rate +
+`max(TX_QUEUE_DEPTH ÷ frame rate, TX_STALL_S)` (second fresh pass, measured:
+25.7 s at 20 frames/s, 7.6 s at 100 frames/s — the queue must fill before the
+drop path runs the check): the interface can only see a write complete, not
+the child consume, and
 the check runs on the DROP path (no timer): a stalled child with no
 offered traffic reads online until the next frame is offered. Not
 changed: the read loop, HDLC framing, respawn on child exit, the
