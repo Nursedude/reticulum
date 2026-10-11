@@ -1485,6 +1485,12 @@ class Reticulum:
                     else:
                         ifstats["tunnelstate"] = None
 
+                # MeshForge fork: a PipeInterface counts frames it dropped and
+                # says whether it is in congested mode (child behind). Without
+                # these, the band's designed drops were invisible outside the log.
+                if hasattr(interface, "tx_dropped"):           ifstats["tx_dropped"] = interface.tx_dropped
+                if hasattr(interface, "tx_congested"):         ifstats["tx_congested"] = bool(interface.tx_congested)
+
                 if hasattr(interface, "r_airtime_short"):      ifstats["airtime_short"] = interface.r_airtime_short
                 if hasattr(interface, "r_airtime_long"):       ifstats["airtime_long"] = interface.r_airtime_long
                 if hasattr(interface, "r_channel_load_short"): ifstats["channel_load_short"] = interface.r_channel_load_short

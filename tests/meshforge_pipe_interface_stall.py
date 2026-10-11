@@ -204,9 +204,13 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         frame past its drain rate paid TX_PUT_WAIT_S on that reader: 100 f/s
         x 20 ms saturated it, and control traffic on the arriving TCP
         interface (never touching the pipe) ran 8 s median / 20 s worst.
-        Once a put has timed out with the kernel pipe FULL (the child is
-        behind, not the writer unscheduled), the next frames must not wait
-        again until the queue has drained to TX_LOW_WATER."""
+        Once puts have timed out with the kernel pipe FULL for
+        TX_CONGEST_FULL_S (the child is behind — not the writer unscheduled,
+        not the child unscheduled for one slice), the next frames must not
+        wait again until the queue has drained to TX_LOW_WATER. The budget
+        is the gate's own cost: one caller pays one wait per TX_PUT_WAIT_S of
+        the span (3 more after the first, measured 3 of 100) — never 100."""
+        allowed = int(PI.PipeInterface.TX_CONGEST_FULL_S / PI.PipeInterface.TX_PUT_WAIT_S) + 1
         self._swap_iface({"name": "slow", "command": self.cfg["command"] + " slow"})
         # Isolate the caller cost from the stall detector: never go offline here.
         with mock.patch.object(PI.PipeInterface, "TX_STALL_S", 3600.0):
@@ -220,7 +224,7 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
                 total += dt
                 if dt >= 0.015: slow_calls += 1
             self.assertTrue(self.iface.online, "went offline; the measurement would be vacuous")
-        self.assertLessEqual(slow_calls, 2, f"{slow_calls} of 100 calls waited for a slot ({total:.2f}s on the caller)")
+        self.assertLessEqual(slow_calls, allowed, f"{slow_calls} of 100 calls waited for a slot ({total:.2f}s on the caller; the gate allows {allowed})")
 
     def test_stall_recovery_waits_for_the_queue_to_drain_to_low_water(self):
         """Same drill: a child draining 2 kB/s on a 16 KB-page kernel frees a
@@ -318,10 +322,157 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
             busy += dt
             if dt >= 0.015: waits += 1
             nxt = t0 + k / 600.0
-            if nxt > time.monotonic(): time.sleep(nxt - time.monotonic())
+            # One clock read: two reads let the deadline pass in between and
+            # hand sleep() a negative length (fresh pass on 6adfa33b, F2).
+            rem = nxt - time.monotonic()
+            if rem > 0: time.sleep(rem)
         self.assertGreater(self.iface.tx_dropped, 0, "the child was never behind; the shape is vacuous")
         self.assertNotEqual(entered, [], "a child that was behind never entered congested mode")
-        self.assertLessEqual(waits, 5, f"{waits} calls waited for a slot ({busy:.2f}s of 5s on the caller)")
+        # The gate's own cost, once: TX_CONGEST_FULL_S of waits before the
+        # episode opens (one caller: ~25), then none until low water.
+        allowed = int(PI.PipeInterface.TX_CONGEST_FULL_S / PI.PipeInterface.TX_PUT_WAIT_S) + 6
+        self.assertLessEqual(waits, allowed, f"{waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed})")
+
+    def test_starved_writer_with_a_draining_child_never_congests(self):
+        """The kernel-fact leg of the gate, pinned on its own: a queue that
+        stays full for longer than TX_CONGEST_FULL_S because the WRITER is
+        slow (GIL-starved) while the child drains everything it gets (pipe
+        writable at every sample) is not a child behind. Fresh pass on
+        94cd084d, F1, made deterministic: the writer's stdin.write is slowed
+        to 30 ms per frame (slower than TX_PUT_WAIT_S, so puts time out); 4
+        tight senders keep the queue full for ~3 s. With the pipe never full
+        the interface must keep mf.6 back-pressure."""
+        entered = self._spy_congestion()
+        real = self.iface.process.stdin
+        class SlowStdin:
+            def write(self, d): time.sleep(0.03); return real.write(d)
+            def flush(self): return real.flush()
+            def fileno(self): return real.fileno()
+            def close(self): return real.close()
+        self.iface.process.stdin = SlowStdin()
+        def send():
+            for _ in range(150): self.iface.process_outgoing(b"w" * 1000)
+        ss = [threading.Thread(target=send, daemon=True) for _ in range(4)]
+        for t in ss: t.start()
+        for t in ss: t.join(30)
+        self.assertFalse(any(t.is_alive() for t in ss), "senders did not finish")
+        self.assertGreater(self.iface.tx_dropped, 0, "no put timed out; the shape is vacuous")
+        self.assertGreater(self.iface.txb, 0)
+        self.assertEqual(entered, [], f"entered congested mode with the pipe writable ({self.iface.tx_dropped} of 600 dropped)")
+        self.assertTrue(self.iface.online)
+
+    def test_healthy_child_paused_briefly_never_congests(self):
+        """Fresh pass on 6adfa33b, F1: "pipe full" is not "child behind". A
+        HEALTHY child that is merely unscheduled longer than TX_PUT_WAIT_S
+        (a `nice 10` child beside 12 busy processes) under a burst filled the
+        pipe + queue, the first timed-out put found the pipe full, and the
+        interface congested: 1487 of 2000 dropped (three interleaved runs,
+        each exactly pipe + queue then everything) where 1.3.8+mf.6 dropped
+        0-93. Here the pause is explicit: the child is SIGSTOPped until the
+        first put times out (pipe full by construction), then resumed at
+        once — a scheduler hiccup, not a child that is behind. The pipe must
+        stay full for TX_CONGEST_FULL_S of timed-out puts before congestion."""
+        entered = self._spy_congestion()
+        stop = threading.Event(); offered = [0]
+        def send():
+            while not stop.is_set():
+                self.iface.process_outgoing(b"p" * 1000); offered[0] += 1
+        ss = [threading.Thread(target=send, daemon=True) for _ in range(4)]
+        for t in ss: t.start()
+        try:
+            for cycle in range(5):
+                dropped0 = self.iface.tx_dropped
+                os.kill(self.child_pid, signal.SIGSTOP)
+                deadline = time.monotonic() + 5
+                while self.iface.tx_dropped == dropped0 and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                os.kill(self.child_pid, signal.SIGCONT)
+                self.assertGreater(self.iface.tx_dropped, dropped0, f"cycle {cycle}: no put timed out; the shape is vacuous")
+                # Let the resumed child drain pipe + queue well past the gate
+                # window before the next pause, so each pause is its own event.
+                time.sleep(0.3)
+        finally:
+            stop.set()
+            for t in ss: t.join(10)
+        self.assertFalse(any(t.is_alive() for t in ss), "senders did not finish")
+        self.assertEqual(entered, [], f"entered congested mode {len(entered)}x with a child that was only paused briefly ({offered[0]} offered, {self.iface.tx_dropped} dropped)")
+        self.assertTrue(self.iface.online)
+
+    def test_short_burst_into_a_slower_child_is_delivered_not_dropped(self):
+        """Fresh pass on 6adfa33b, F1, the shape as the reviewer ran it: a
+        `nice 10` child beside 12 busy processes drains a 2 MB burst in 0.3 s
+        (6.9 MB/s — slower than the senders, behind for the burst's length)
+        and on mf.6 delivered all of it for 19–44 waits; a gate that calls
+        the child behind after one full sample — or after 60 ms of them —
+        dropped 1224–1487 of 2000, because once congested nothing throttles
+        the senders. Deterministic form: a child draining 2 MB/s offered a
+        1 MB burst tight from 4 senders; buffers hold 512 KB, the rest is
+        0.25 s of a full pipe. A burst shorter than TX_CONGEST_FULL_S is
+        back-pressured and delivered (one drop per timed-out put, as mf.6),
+        never dropped wholesale."""
+        self._swap_iface({"name": "burst", "command": self.cfg["command"] + " rate 2000000"})
+        entered = self._spy_congestion()
+        def send():
+            for _ in range(250): self.iface.process_outgoing(b"b" * 1000)
+        ss = [threading.Thread(target=send, daemon=True) for _ in range(4)]
+        for t in ss: t.start()
+        for t in ss: t.join(20)
+        self.assertFalse(any(t.is_alive() for t in ss), "senders did not finish")
+        self.assertEqual(entered, [], f"entered congested mode on a {1000 * 1000 // 1000} kB burst ({self.iface.tx_dropped} of 1000 dropped)")
+        self.assertLessEqual(self.iface.tx_dropped, 150, f"{self.iface.tx_dropped} of 1000 dropped: the burst was dropped, not back-pressured")
+        self.assertTrue(self.iface.online)
+
+    def test_congestion_episode_is_logged_at_entry_and_exit(self):
+        """Fresh pass on 6adfa33b, F3: `tx_dropped` had no reader — not in the
+        interface stats, not in rnstatus — and the only log lines were the two
+        stall WARNINGs, so a congestion episode with a child that keeps
+        draining (the whole band this cure is for: 1017 frames dropped in 15 s
+        at 200 kB/s drained / 300 kB/s offered) left NOTHING an operator could
+        see while rnstatus read Up. Every episode now leaves a witness: one
+        line when it begins, one with the count when the child has caught up."""
+        self._swap_iface({"name": "fast", "command": self.cfg["command"] + " rate 200000"})
+        lines = []
+        real_log = RNS.log
+        def spy(msg, *a, **k):
+            if str(self.iface) in str(msg): lines.append(str(msg))
+            return real_log(msg, *a, **k)
+        with mock.patch.object(RNS, "log", spy):
+            t_end = time.monotonic() + 3.0; k = 0; t0 = time.monotonic()
+            while time.monotonic() < t_end:
+                k += 1; self.iface.process_outgoing(b"f" * 1000)
+                rem = t0 + k / 600.0 - time.monotonic()
+                if rem > 0: time.sleep(rem)
+            self.assertTrue(self.iface.tx_congested, "the child was never behind; the shape is vacuous")
+            entry = [l for l in lines if "behind" in l]
+            self.assertEqual(len(entry), 1, lines)
+            # Stop offering: 256 queued frames drain at 200 f/s in ~1.3 s; the
+            # next offer notices the low-water mark and closes the episode.
+            time.sleep(2.0)
+            self.iface.process_outgoing(b"f" * 1000)
+            self.assertFalse(self.iface.tx_congested)
+            exit_ = [l for l in lines if "caught up" in l]
+            self.assertEqual(len(exit_), 1, lines)
+            self.assertIn("dropped during the episode", exit_[0])
+        self.assertTrue(self.iface.online)
+
+    def test_interface_stats_carry_dropped_and_congested(self):
+        """Same finding, the rnstatus half: `get_interface_stats` must expose
+        the drop counter and the congested flag for a PipeInterface so the
+        designed drops in the band are legible outside the log."""
+        fake = mock.MagicMock(is_connected_to_shared_instance=False)
+        # Set by the config loader on a real instance, read unguarded by the
+        # stats builder; the fixture constructs the interface directly.
+        for attr in ("announce_rate_target", "announce_rate_grace", "announce_rate_penalty",
+                     "held_announces", "ic_burst_active", "ic_burst_activated",
+                     "ic_pr_burst_active", "ic_pr_burst_activated"):
+            if not hasattr(self.iface, attr): setattr(self.iface, attr, None)
+        if not hasattr(self.iface, "mode"): self.iface.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+        with mock.patch.object(RNS.Transport, "interfaces", [self.iface]):
+            stats = RNS.Reticulum.get_interface_stats(fake)
+        ifs = [i for i in stats["interfaces"] if i["short_name"] == self.iface.name]
+        self.assertEqual(len(ifs), 1, stats["interfaces"])
+        self.assertEqual(ifs[0]["tx_dropped"], self.iface.tx_dropped)
+        self.assertIs(ifs[0]["tx_congested"], False)
 
 
 if __name__ == "__main__":
