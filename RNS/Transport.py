@@ -85,7 +85,18 @@ class Transport:
     # MeshForge fork: overall budget (seconds) for detach_interfaces() so a busy
     # transport node's SIGTERM teardown cannot hang the main thread. Env override:
     # RNS_DETACH_TIMEOUT. See detach_interfaces() for the rationale.
-    DETACH_TIMEOUT              = float(os.environ.get("RNS_DETACH_TIMEOUT", 5))
+    @staticmethod
+    def _detach_timeout_from(raw, default=5.0):
+        # Thread.join() raises on inf/nan, and a bad value used to raise at
+        # `import RNS`. Anything join() cannot take falls back to the default;
+        # the raw value is returned as the witness (logged at start()).
+        if raw is None: return default, None
+        try: value = float(raw)
+        except ValueError: return default, raw
+        if not math.isfinite(value) or value < 0: return default, raw
+        return value, None
+
+    DETACH_TIMEOUT, DETACH_TIMEOUT_REJECTED = _detach_timeout_from.__func__(os.environ.get("RNS_DETACH_TIMEOUT"))
 
     STATE_UNKNOWN               = 0x00
     STATE_UNRESPONSIVE          = 0x01
@@ -223,6 +234,8 @@ class Transport:
     def start(reticulum_instance):
         Transport.owner = reticulum_instance
         Transport.PR_LOGLEVEL = RNS.LOG_EXTREME
+        if Transport.DETACH_TIMEOUT_REJECTED is not None:
+            RNS.log(f"Ignoring RNS_DETACH_TIMEOUT={Transport.DETACH_TIMEOUT_REJECTED!r} (needs a finite number >= 0); using {Transport.DETACH_TIMEOUT}s", RNS.LOG_WARNING)
 
         if Transport.identity == None:
             transport_identity_path = RNS.Reticulum.storagepath+"/transport_identity"

@@ -1085,6 +1085,8 @@ class Reticulum:
                         # the shared instance). See RNS.panic.
                         guard = RNS._external_interface_load
                         guard.depth = getattr(guard, "depth", 0) + 1
+                        outer_panicked = getattr(guard, "panicked", False)
+                        guard.panicked = False
                         try:
                             RNS.log(f"Loading external interface \"{interface_file}\" from \"{self.interfacepath}\"", RNS.LOG_NOTICE)
                             interface_globals = {}
@@ -1099,6 +1101,9 @@ class Reticulum:
                                     interface = interface_class(RNS.Transport, interface_config)
                                     interface_post_init(interface)
 
+                            if guard.panicked:
+                                raise RNS.ExternalInterfacePanic("the interface swallowed an RNS.panic() while loading")
+
                         except (Exception, SystemExit, RNS.ExternalInterfacePanic) as e:
                             # interface_post_init registers the interface
                             # BEFORE final_init(): a failure there must not
@@ -1112,9 +1117,13 @@ class Reticulum:
                                 # restarts a crash, not a hang).
                                 refused = interface
                                 def _detach_refused():
+                                    # The guard is thread-local: without this a
+                                    # panic() in detach() is os._exit(255) from
+                                    # the containment's own cleanup (F1).
+                                    RNS._external_interface_load.depth = 1
                                     try: refused.detach()
-                                    except Exception as de:
-                                        RNS.log(f"Detaching refused interface {interface_type} / {name} failed: {de}", RNS.LOG_ERROR)
+                                    except BaseException as de:
+                                        RNS.log(f"Detaching refused interface {interface_type} / {name} failed: {type(de).__name__}: {de}", RNS.LOG_ERROR)
                                 dt = threading.Thread(target=_detach_refused, daemon=True,
                                                       name=f"detach-refused-{interface_type}")
                                 dt.start()
@@ -1122,7 +1131,9 @@ class Reticulum:
                                 if dt.is_alive():
                                     RNS.log(f"Refused interface {interface_type} / {name} did not finish detaching within {RNS.Transport.DETACH_TIMEOUT}s; continuing without waiting", RNS.LOG_WARNING)
                             interface = None
-                            if isinstance(e, RNS.ExternalInterfacePanic):
+                            if isinstance(e, RNS.ExternalInterfacePanic) and "swallowed" in str(e):
+                                RNS.log(f"External interface {interface_type} / {name} refused: it swallowed an RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
+                            elif isinstance(e, RNS.ExternalInterfacePanic):
                                 RNS.log(f"External interface {interface_type} / {name} refused: it called RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
                             elif isinstance(e, SystemExit):
                                 RNS.log(f"External interface {interface_type} / {name} refused: it called sys.exit({e.code!r}) while loading. Continuing without it.", RNS.LOG_CRITICAL)
@@ -1131,6 +1142,7 @@ class Reticulum:
 
                         finally:
                             guard.depth -= 1
+                            guard.panicked = outer_panicked
 
             else:
                 RNS.log("Skipping disabled interface \""+name+"\"", RNS.LOG_DEBUG)

@@ -67,6 +67,20 @@ class MeshForgeDetachTimeoutTest(unittest.TestCase):
         for k, v in self._saved.items():
             setattr(Transport, k, v)
 
+    def test_detach_timeout_parse_rejects_what_join_cannot_take(self):
+        # Review 2026-10-10 (fresh pass) F3: inf/nan reached Thread.join() and
+        # raised OverflowError/ValueError -> a refusal became exit 255; an
+        # unparseable value raised at `import RNS` for every RNS program.
+        parse = Transport._detach_timeout_from
+        self.assertEqual(parse(None), (5.0, None))
+        self.assertEqual(parse("2.5"), (2.5, None))
+        self.assertEqual(parse("0"), (0.0, None))
+        for bad in ("inf", "-inf", "nan", "-1", "abc", ""):
+            with self.subTest(raw=bad):
+                value, rejected = parse(bad)
+                self.assertEqual(value, 5.0)
+                self.assertEqual(rejected, bad)   # kept as the witness
+
     def test_detach_timeout_constant_is_positive_float(self):
         self.assertIsInstance(self._saved["DETACH_TIMEOUT"], float)
         self.assertGreater(self._saved["DETACH_TIMEOUT"], 0)

@@ -102,6 +102,48 @@ PLUGINS = {
                 threading.Event().wait()
         interface_class = BlockingDetach
     """,
+    # Review 2026-10-10 (fresh pass) F1: the refusal detaches on a fresh
+    # thread; the guard is thread-local, so a panic() in detach() used to run
+    # with the guard OFF and os._exit(255) rnsd from the containment's own
+    # cleanup.
+    "PanicInDetach": """
+        class PanicInDetach(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+            def final_init(self):
+                RNS.panic()
+            def detach(self):
+                RNS.panic()
+        interface_class = PanicInDetach
+    """,
+    # F2: a detach() raising SystemExit was caught by nothing on that thread
+    # and left no RNS log line -- a swallow without a witness.
+    "ExitInDetach": """
+        import sys
+        class ExitInDetach(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+            def final_init(self):
+                RNS.panic()
+            def detach(self):
+                sys.exit(7)
+        interface_class = ExitInDetach
+    """,
+    # F4: a plugin's bare `except:` catches even a BaseException, so the
+    # panic was swallowed and the interface loaded as healthy, silently.
+    "BareExceptSwallow": """
+        class BareExceptSwallow(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+                try:
+                    RNS.panic()
+                except:
+                    pass
+        interface_class = BareExceptSwallow
+    """,
     # control: an ordinary import error was ALREADY contained upstream
     "RaiseAtImport": """
         raise ImportError("No module named 'meshcore'")
@@ -168,6 +210,40 @@ class MeshForgeExternalInterfacePanicTest(unittest.TestCase):
         self.assertIn("SURVIVED", r.stdout, out)
         self.assertIn("REGISTERED 0", r.stdout, out)
         self.assertIn("did not finish detaching", out, out)
+
+    def _assert_refused_cleanly(self, itype, env=None):
+        r = _run(itype, env=env,
+                 after='print("REGISTERED", len(RNS.Transport.interfaces), flush=True)')
+        out = r.stdout + r.stderr
+        self.assertNotEqual(r.returncode, 255, f"{itype}: rnsd would exit (RNS.panic)\n{out}")
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("SURVIVED", r.stdout, out)
+        self.assertIn("refused", out, out)
+        self.assertIn("REGISTERED 0", r.stdout, out)
+        return out
+
+    def test_panic_in_detach_of_a_refused_interface_is_contained(self):
+        out = self._assert_refused_cleanly("PanicInDetach")
+        self.assertIn("Detaching refused interface PanicInDetach", out, out)
+
+    def test_sys_exit_in_detach_of_a_refused_interface_leaves_a_witness(self):
+        out = self._assert_refused_cleanly("ExitInDetach")
+        self.assertIn("Detaching refused interface ExitInDetach", out, out)
+        self.assertIn("SystemExit", out, out)
+
+    def test_plugin_bare_except_cannot_swallow_a_panic(self):
+        out = self._assert_refused_cleanly("BareExceptSwallow")
+        self.assertIn("swallowed", out, out)
+
+    def test_infinite_detach_timeout_does_not_turn_a_refusal_into_an_exit(self):
+        for raw in ("inf", "nan"):
+            with self.subTest(RNS_DETACH_TIMEOUT=raw):
+                self._assert_refused_cleanly("PanicInFinalInit", env={"RNS_DETACH_TIMEOUT": raw})
+
+    def test_unparseable_detach_timeout_does_not_break_import(self):
+        r = _run("PanicInInit", env={"RNS_DETACH_TIMEOUT": "abc"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("SURVIVED", r.stdout, r.stdout + r.stderr)
 
     def test_panic_outside_external_loading_still_exits(self):
         r = _run("NoSuchInterface", after="RNS.panic()")

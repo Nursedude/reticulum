@@ -386,6 +386,9 @@ _external_interface_load = threading.local()
 
 def panic():
     if getattr(_external_interface_load, "depth", 0) > 0:
+        # Recorded before raising: the loader refuses the interface even if a
+        # plugin's bare `except:` swallows the raise (review 2026-10-10 F4).
+        _external_interface_load.panicked = True
         raise ExternalInterfacePanic("RNS.panic() called while loading an external interface")
     os._exit(255)
 

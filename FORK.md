@@ -130,6 +130,23 @@ failed, instead of leaving a dead entry while the log says it is gone (F1).
 That detach is bounded by `RNS_DETACH_TIMEOUT` on a daemon thread: a plugin
 whose `detach()` never returns costs a WARNING, not an rnsd that hangs at
 startup (systemd restarts a crash, not a hang).
+Second review fixes (fresh non-author pass 2026-10-10): the refused
+interface's `detach()` runs with the guard ON, so a `panic()` there is
+contained instead of `os._exit(255)` from the cleanup thread (F1), and any
+`BaseException` it raises (`SystemExit`, `KeyboardInterrupt`) is logged
+`Detaching refused interface ... failed: <Type>` instead of vanishing (F2);
+`RNS_DETACH_TIMEOUT` must be a finite number >= 0 — `inf`/`nan`/negative/
+unparseable fall back to 5 s with a WARNING at `Transport.start()` (inf/nan
+used to raise inside the refusal handler and exit 255; an unparseable value
+raised at `import RNS` for every program) (F3); and `RNS.panic()` records
+that it was called, so a plugin whose BARE `except:` swallows the raise is
+still refused, logged `it swallowed an RNS.panic()` (F4).
+"Refused" means unregistered from Transport, NOT inert: threads the plugin
+started keep running (and can still feed `Transport.inbound`) until its own
+`detach()` stops them, and the loader removes only what IT registered — a
+sub-interface the plugin registered itself survives, and a `bootstrap_only`
+plugin's config stays in `bootstrap_configs`, so Discovery may re-synthesise
+it (and re-refuse it, CRITICAL each time) when no discovered interface is up.
 Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
 unpatched tree: rc 255 / rc 3; the two controls pass on both; the two review
 cases fail on `0f8f637f` with `REGISTERED 1`, pass after). Also fixed:
