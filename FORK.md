@@ -118,20 +118,32 @@ every ~8 s: on a 16 KB-page kernel the writer gets room only when the child
 has consumed a whole page (16 KB ÷ 2 kB/s > `TX_STALL_S`), and the first
 completed write flipped it back with the queue still full. A SIGSTOPped
 child was fine (1.23 s worst, ×2); stock was worse in every shape (rnsd's
-own announcing thread froze). Cure: once a put times out the interface is
-CONGESTED — frames are offered with `put_nowait` (dropped and counted only
-if the queue is full) until the queue has drained to `TX_LOW_WATER`
-(`TX_QUEUE_DEPTH // 2` = 128), so each caller pays at most one wait per
-episode; a healthy-child burst still gets the back-pressure (fresh pass F2:
-a draining child frees slots, so `put_nowait` rarely meets a full queue).
-The same mark gates recovery from a stall: the interface comes back Up when
-a write completes AND the queue is at or below `TX_LOW_WATER`, so a slow
-child no longer flaps on every page. Not changed: stall detection (still the
+own announcing thread froze). Cure: a put that times out while the writer
+has been blocked INSIDE a write for `TX_CONGEST_WRITE_S` (0.1 s — the pipe
+is full, so the child is behind) makes the interface CONGESTED — frames are
+offered with `put_nowait` (dropped and counted only if the queue is full)
+until the queue has drained to `TX_LOW_WATER` (`TX_QUEUE_DEPTH // 2` = 128),
+so each caller thread pays at most ~`TX_CONGEST_WRITE_S` of waits per
+episode. Congested mode has NO back-pressure, which is why it needs that
+evidence: in the first cut (`94cd084d`) any timeout entered it, and a
+HEALTHY child whose writer had merely not been scheduled (4 senders + 1
+CPU-burning thread) dropped 1242–1739 of 2000 frames where `1.3.8+mf.6`
+dropped 67–117 (fresh pass F1). With the write-blocked gate the same shape
+drops what mf.6 drops (27–61 vs 44–64, 0 congestion episodes), and a
+healthy-child burst keeps mf.6's back-pressure. The same low-water mark
+gates recovery from a stall: the interface comes back Up when a write
+completes AND the queue is at or below `TX_LOW_WATER`, so a slow child no
+longer flaps on every page — at the price of a longer Down: time-to-Up
+after a stall is about `TX_LOW_WATER` frames ÷ the child's drain rate
+(~128 KB of 1 KB frames: about a minute at 2 kB/s, longer at LoRa rates),
+while bytes delivered are unchanged (fresh pass F2). Not changed: stall detection (still the
 drop path, still `TX_STALL_S` from the last completed write), queue depth,
 respawn. Tests (in `tests/meshforge_pipe_interface_stall.py`, red on
 `5f9d0553` = `1.3.8+mf.6` code): a child started with `slow` (200 B per
-100 ms) — 100 of 100 calls waited for a slot (2.01 s on the caller), now ≤ 2;
-SIGSTOP → offline → SIGCONT — Up with 256 frames still queued, now ≤ 128.
+100 ms) — 100 of 100 calls waited for a slot (2.01 s on the caller), now ≤ `TX_CONGEST_WRITE_S ÷ TX_PUT_WAIT_S` + 1;
+SIGSTOP → offline → SIGCONT — Up with 256 frames still queued, now ≤ 128;
+4 senders + a CPU-burning thread on a HEALTHY child must never enter
+congested mode (red on `94cd084d`).
 No wire or crypto change.
 
 ### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd

@@ -85,6 +85,13 @@ class PipeInterface(Interface):
     # pipe page less often than TX_STALL_S (16 KB pages at 2 kB/s: ~8 s)
     # does not flap Down/Up on every page.
     TX_LOW_WATER = TX_QUEUE_DEPTH // 2
+    # A put timeout is evidence of a child that is BEHIND only when the
+    # writer is blocked inside a write the kernel will not complete (pipe
+    # full). A timeout while the writer is merely waiting for the GIL is a
+    # healthy child under CPU contention: entering congestion there removed
+    # the back-pressure and dropped frames 1.3.8+mf.6 took (fresh pass F1 on
+    # 94cd084d: 4 senders + 1 CPU burner, 1242-1739 of 2000 vs 67-117).
+    TX_CONGEST_WRITE_S = 0.1
 
     owner    = None
     command  = None
@@ -119,6 +126,7 @@ class PipeInterface(Interface):
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
         self._tx_congested = False
+        self._tx_write_started = None
         self._writer_gen = 0
         self._writer = None
 
@@ -161,6 +169,7 @@ class PipeInterface(Interface):
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
         self._tx_congested = False
+        self._tx_write_started = None
         self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
                                         name=f"pipe-writer-{self.name}")
         self._writer.start()
@@ -182,7 +191,9 @@ class PipeInterface(Interface):
                 if self._tx_congested: self._txq.put_nowait(data)
                 else: self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
             except queue.Full:
-                self._tx_congested = True
+                started = self._tx_write_started
+                if started is not None and time.monotonic() - started >= PipeInterface.TX_CONGEST_WRITE_S:
+                    self._tx_congested = True
                 self.tx_dropped += 1
                 self._check_tx_stall()
         elif self._tx_stalled:
@@ -212,6 +223,7 @@ class PipeInterface(Interface):
                 except queue.Full: pass
                 return
             try:
+                if gen == self._writer_gen: self._tx_write_started = time.monotonic()
                 written = process.stdin.write(data)
                 process.stdin.flush()
             except Exception as e:
@@ -219,6 +231,8 @@ class PipeInterface(Interface):
                 if gen == self._writer_gen:
                     self.online = False
                 return
+            finally:
+                if gen == self._writer_gen: self._tx_write_started = None
             self.txb += len(data)
             self._tx_last_drain = time.monotonic()
             if written != len(data):
