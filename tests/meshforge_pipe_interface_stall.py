@@ -46,7 +46,9 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         with open(child, "w") as f: f.write(CHILD)
         self.cfg = {"name": "stall", "command": f"{sys.executable} -u {child}"}
         self.patches = [mock.patch.object(RNS.Reticulum, "transport_enabled", staticmethod(lambda: False)),
-                        mock.patch.object(RNS.Reticulum, "get_instance", staticmethod(lambda: mock.MagicMock(interfacepath=self.tmp.name)))]
+                        mock.patch.object(RNS.Reticulum, "get_instance", staticmethod(lambda: mock.MagicMock(interfacepath=self.tmp.name))),
+                        # set by Reticulum.__init__ on a real instance; the respawn path reads it
+                        mock.patch.object(RNS.Reticulum, "panic_on_interface_error", False, create=True)]
         for p in self.patches: p.start()
         self.owner = FakeOwner()
         self.iface = PI.PipeInterface(self.owner, self.cfg)
@@ -115,6 +117,41 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         while not self.iface.online and time.monotonic() < deadline:
             time.sleep(0.2)
         self.assertTrue(self.iface.online, "did not come back online after the child resumed draining")
+
+    def test_child_crash_respawn_stays_online(self):
+        """Fresh pass F1 (2026-10-10): after the child died and was respawned,
+        the previous writer thread was still parked on the shared queue; it
+        took the next frame, broke on the dead child's pipe and set
+        online=False beside a LIVE new child, with nothing to set it back."""
+        old_pid = self.child_pid
+        os.kill(old_pid, signal.SIGKILL)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and (self.iface.process.pid == old_pid or not self.iface.online):
+            time.sleep(0.05)
+        self.assertNotEqual(self.iface.process.pid, old_pid, "child was not respawned")
+        self.child_pid = self.iface.process.pid
+        self.assertTrue(self.iface.online)
+        # Offer traffic right after the respawn, the way announces and path
+        # requests land on a busy rnsd; far under the queue depth, no stall.
+        for _ in range(50):
+            self.iface.process_outgoing(b"z" * 200); time.sleep(0.02)
+        time.sleep(0.5)
+        self.assertTrue(self.iface.online, "online went False after a respawn with a live child")
+        self.assertIsNone(self.iface.process.poll(), "respawned child died")
+        self.assertEqual(self.iface.tx_dropped, 0)
+        writers = [t for t in threading.enumerate() if t.name.startswith("pipe-writer-")]
+        self.assertEqual(len(writers), 1, f"writer threads alive: {[t.name for t in writers]}")
+
+    def test_healthy_child_burst_drops_nothing(self):
+        """Fresh pass F2: a tight burst of frames a draining child would have
+        taken (stock: 0 drops, the kernel pipe absorbs it) must not be dropped
+        because the queue filled faster than the writer got the GIL."""
+        done, worst = self._send_many(2000, size=1000, budget_s=20.0)
+        self.assertTrue(done)
+        self.assertLess(worst, 1.0, f"a single process_outgoing took {worst:.2f}s")
+        time.sleep(0.5)
+        self.assertEqual(self.iface.tx_dropped, 0, f"{self.iface.tx_dropped} frames dropped with a healthy child")
+        self.assertTrue(self.iface.online)
 
 
 if __name__ == "__main__":

@@ -113,8 +113,16 @@ blocks that thread for as long as it stays stalled; bench drill 2026-10-10
 sending thread blocked 47 s at `PipeInterface.py:130`, the TCP interface's
 traffic went 20 kB/s → 0 on the same thread, `online` stayed True. Cure:
 outbound frames go through a bounded queue (`TX_QUEUE_DEPTH` = 64) drained
-by one writer thread per spawned child; when the queue is full the frame is
-dropped and counted (`tx_dropped`), and if no write has COMPLETED for
+by one writer thread per spawned child (the previous child's writer is
+retired before the next starts and never writes a frame to a child it was
+not spawned for — fresh pass F1: a parked writer took the next frame, broke on
+the dead pipe and marked the LIVE respawned interface offline, 18/20);
+`TX_QUEUE_DEPTH` = 256 and a full queue makes the caller wait at most
+`TX_PUT_WAIT_S` (20 ms) for a slot — back-pressure for a draining child
+(fresh pass F2: a 64-deep queue with no wait dropped 436 of a 500-frame burst
+that stock's 256 KB pipe absorbed; now a 2000-frame burst drops 0); only
+then is the frame dropped and counted (`tx_dropped`, which also counts frames
+offered while offline so the recovery line is honest), and if no write has COMPLETED for
 `TX_STALL_S` (5 s) the interface goes `online = False` (rnstatus: Down,
 `process_outgoing` drops) with a WARNING naming the stall and the drop
 count; the first completed write after that flips it back with a second
@@ -128,8 +136,9 @@ draining; a child that drains but never answers is still invisible here
 (`last_read_ms` is computed and unused, as upstream). Test:
 `tests/meshforge_pipe_interface_stall.py` — three cases with a real
 SIGSTOPped subprocess; on `1.3.8+mf.5` the caller-blocks case FAILS (8 s
-budget) and the offline case ERRORS (no `TX_STALL_S`); the healthy-child
-control passes on both. No wire or crypto change.
+budget) and the offline case ERRORS (no `_tx_last_drain`); the healthy-child
+control passes on both; the respawn and healthy-burst cases are red on
+`eb192fa4` (online False after respawn; 1935 of 2000 dropped). No wire or crypto change.
 
 ### `1.3.8+mf.5` (2026-10-10) — an external interface that panics while loading costs that interface, not rnsd
 

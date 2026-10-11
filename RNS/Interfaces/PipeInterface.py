@@ -65,8 +65,13 @@ class PipeInterface(Interface):
     # the moment the child drains again. Bench drill 2026-10-10: stock blocked
     # the sending thread 47 s on a SIGSTOPped child, every other interface on
     # that thread starved, `online` True throughout.
-    TX_QUEUE_DEPTH = 64
+    TX_QUEUE_DEPTH = 256
     TX_STALL_S = 5.0
+    # A full queue with a child that is still draining is back-pressure, not
+    # a stall: the caller waits at most this long for a slot before the frame
+    # is dropped (fresh pass F2: a 64-deep queue dropped frames a healthy
+    # child would have taken, because the writer had not had the GIL yet).
+    TX_PUT_WAIT_S = 0.02
 
     owner    = None
     command  = None
@@ -101,6 +106,7 @@ class PipeInterface(Interface):
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
         self._writer_gen = 0
+        self._writer = None
 
         try:
             self.open_pipe()
@@ -132,11 +138,17 @@ class PipeInterface(Interface):
         thread.daemon = True
         thread.start()
         self._writer_gen += 1
+        # Retire the previous child's writer BEFORE the new one starts: a
+        # writer still parked on the shared queue would take the next frame,
+        # break on the dead child's pipe and mark the LIVE interface offline
+        # (fresh pass F1, 18/20 respawns).
+        if self._writer is not None and self._writer.is_alive():
+            self._writer.join(1.0)
         self._tx_last_drain = time.monotonic()
         self._tx_stalled = False
-        writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
-                                  name=f"pipe-writer-{self.name}")
-        writer.start()
+        self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
+                                        name=f"pipe-writer-{self.name}")
+        self._writer.start()
         self.online = True
         RNS.log("Subprocess pipe for "+str(self)+" is now connected", RNS.LOG_VERBOSE)
 
@@ -150,10 +162,13 @@ class PipeInterface(Interface):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
             try:
-                self._txq.put_nowait(data)
+                self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
             except queue.Full:
                 self.tx_dropped += 1
                 self._check_tx_stall()
+        elif self._tx_stalled:
+            # Offered while stalled: counted, so the recovery line is honest.
+            self.tx_dropped += 1
 
     def _check_tx_stall(self):
         # Called when the queue is full: the writer is wedged in a write the
@@ -171,12 +186,19 @@ class PipeInterface(Interface):
                 data = self._txq.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if gen != self._writer_gen or self.detached:
+                # Retired while waiting: hand the frame back for the live
+                # writer; never write it to this generation's child.
+                try: self._txq.put_nowait(data)
+                except queue.Full: pass
+                return
             try:
                 written = process.stdin.write(data)
                 process.stdin.flush()
             except Exception as e:
                 RNS.log(f"{self} write to subprocess failed: {e}", RNS.LOG_ERROR)
-                self.online = False
+                if gen == self._writer_gen:
+                    self.online = False
                 return
             self.txb += len(data)
             self._tx_last_drain = time.monotonic()
