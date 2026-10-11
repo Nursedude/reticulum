@@ -87,6 +87,21 @@ PLUGINS = {
                     pass
         interface_class = SwallowPanic
     """,
+    # The refusal detaches what it unregisters (F1). A plugin whose detach()
+    # never returns must not turn "refused" into "rnsd hangs at startup" --
+    # systemd restarts a crash, not a hang. Bounded by RNS_DETACH_TIMEOUT.
+    "BlockingDetach": """
+        import threading
+        class BlockingDetach(Interface):
+            DEFAULT_IFAC_SIZE = 16
+            def __init__(self, owner, configuration):
+                super().__init__()
+            def final_init(self):
+                RNS.panic()
+            def detach(self):
+                threading.Event().wait()
+        interface_class = BlockingDetach
+    """,
     # control: an ordinary import error was ALREADY contained upstream
     "RaiseAtImport": """
         raise ImportError("No module named 'meshcore'")
@@ -94,14 +109,15 @@ PLUGINS = {
 }
 
 
-def _run(itype, after=""):
+def _run(itype, after="", env=None):
     with tempfile.TemporaryDirectory() as ipath:
         if itype in PLUGINS:
             with open(os.path.join(ipath, f"{itype}.py"), "w") as f:
                 f.write(textwrap.dedent(PLUGINS[itype]))
         code = CHILD.format(repo=REPO, ipath=ipath, itype=itype, after=after)
         return subprocess.run([sys.executable, "-c", code], capture_output=True,
-                              text=True, timeout=60, cwd=ipath)
+                              text=True, timeout=60, cwd=ipath,
+                              env={**os.environ, **(env or {})})
 
 
 class MeshForgeExternalInterfacePanicTest(unittest.TestCase):
@@ -143,6 +159,15 @@ class MeshForgeExternalInterfacePanicTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, out)
         self.assertIn("refused", out, out)
         self.assertIn("REGISTERED 0", r.stdout, out)
+
+    def test_refusal_does_not_hang_on_a_blocking_detach(self):
+        r = _run("BlockingDetach", env={"RNS_DETACH_TIMEOUT": "0.5"},
+                 after='print("REGISTERED", len(RNS.Transport.interfaces), flush=True)')
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 0, out)
+        self.assertIn("SURVIVED", r.stdout, out)
+        self.assertIn("REGISTERED 0", r.stdout, out)
+        self.assertIn("did not finish detaching", out, out)
 
     def test_panic_outside_external_loading_still_exits(self):
         r = _run("NoSuchInterface", after="RNS.panic()")

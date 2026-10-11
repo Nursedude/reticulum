@@ -127,6 +127,9 @@ Review fixes (same entry, not yet tagged): `ExternalInterfacePanic` is a
 and load as healthy (F2); and a refusal now UNREGISTERS and detaches an
 interface that `interface_post_init` had already added before `final_init()`
 failed, instead of leaving a dead entry while the log says it is gone (F1).
+That detach is bounded by `RNS_DETACH_TIMEOUT` on a daemon thread: a plugin
+whose `detach()` never returns costs a WARNING, not an rnsd that hangs at
+startup (systemd restarts a crash, not a hang).
 Test: `tests/meshforge_external_interface_panic.py` (4 of 6 fail on the
 unpatched tree: rc 255 / rc 3; the two controls pass on both; the two review
 cases fail on `0f8f637f` with `REGISTERED 1`, pass after). Also fixed:

@@ -1106,9 +1106,21 @@ class Reticulum:
                             # log says it is gone (review 2026-10-10 F1).
                             if interface is not None:
                                 RNS.Transport.remove_interface(interface)
-                                try: interface.detach()
-                                except Exception as de:
-                                    RNS.log(f"Detaching refused interface {interface_type} / {name} failed: {de}", RNS.LOG_ERROR)
+                                # Bounded: a plugin whose detach() never
+                                # returns must not turn a refusal into an
+                                # rnsd that hangs at startup (systemd
+                                # restarts a crash, not a hang).
+                                refused = interface
+                                def _detach_refused():
+                                    try: refused.detach()
+                                    except Exception as de:
+                                        RNS.log(f"Detaching refused interface {interface_type} / {name} failed: {de}", RNS.LOG_ERROR)
+                                dt = threading.Thread(target=_detach_refused, daemon=True,
+                                                      name=f"detach-refused-{interface_type}")
+                                dt.start()
+                                dt.join(RNS.Transport.DETACH_TIMEOUT)
+                                if dt.is_alive():
+                                    RNS.log(f"Refused interface {interface_type} / {name} did not finish detaching within {RNS.Transport.DETACH_TIMEOUT}s; continuing without waiting", RNS.LOG_WARNING)
                             interface = None
                             if isinstance(e, RNS.ExternalInterfacePanic):
                                 RNS.log(f"External interface {interface_type} / {name} refused: it called RNS.panic() while loading. Continuing without it.", RNS.LOG_CRITICAL)
