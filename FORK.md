@@ -122,8 +122,8 @@ own announcing thread froze). Cure: when puts have timed out while the
 KERNEL reports the pipe full (`select()` says not writable — the writer is
 parked in `flush()`) for `TX_CONGEST_FULL_S` (0.5 s), the interface is
 CONGESTED — frames are offered with `put_nowait` (dropped and counted only
-if the queue is full) until the queue has drained to `TX_LOW_WATER`
-(`TX_QUEUE_DEPTH // 2` = 128). A caller pays at most `TX_CONGEST_FULL_S` of
+if the queue is full) until the child has CAUGHT UP: the queue is empty AND
+the kernel pipe has room (`_child_caught_up`). A caller pays at most `TX_CONGEST_FULL_S` of
 waits per episode (one caller: ~25 × 20 ms; measured 27 in a 5 s run at
 200 kB/s drained / 600 f/s offered, where mf.6 paid 187, i.e. 75 % of the
 caller's time, for the run's whole length), then none. Congested mode has
@@ -151,9 +151,23 @@ overload this cure is for is DURATION, so the gate is a span of pipe-full
 timeouts, 0.5 s: far above scheduler latency on a loaded Pi, far below
 `TX_STALL_S` (5 s) and the 8 s saturation measured on mf.6. The span is
 abandoned when a timed-out put finds the pipe writable (the writer is not
-blocked — a starved writer is not a child behind), when the writer drains
-the queue to `TX_LOW_WATER` (the burst was absorbed), or when no put has
-timed out for `TX_CONGEST_FULL_S`. With this gate the `nice 10` shape reads
+blocked — a starved writer is not a child behind), when the writer finds the
+child caught up (queue empty AND pipe writable — the burst was absorbed), or
+when no put has timed out for `TX_CONGEST_FULL_S`. "Caught up" was first cut
+as "the queue drained to `TX_LOW_WATER`" (128 frames) and the fresh pass on
+`925d275c` broke it (F1): a child that is behind at a steady rate but reads
+in GULPS — one `os.read` of a large buffer empties the whole 256 KB pipe —
+makes that true every cycle: the writer dumps the whole queue into the
+emptied pipe, the queue reads empty, the episode closes and the span resets
+while the child is as far behind as before, and the reader pays the next
+0.5 s of waits again: at 200 kB/s drained / 300 f/s offered, 9 episodes in
+30 s, 451 waits, reader duty 0.31 (6adfa33b: 0.02; mf.6: 0.78), "caught up"
+logged nine times about a child that never did. It was also page-size
+coupled (128 KB of low water is below a 256 KB pipe on 16 KB pages; on a
+4 KB-page kernel the 64 KB pipe cannot free 128 slots in one gulp, so that
+leg could not fire that way there). With caught-up = queue EMPTY and pipe
+WRITABLE the same shape is 1 episode that never closes, 44 waits, duty 0.03,
+bytes delivered unchanged (6 372 720 B). With this gate the `nice 10` shape reads
 as mf.6 (11–23 dropped vs 13–54, 0 episodes, three interleaved pairs); the
 GIL-contention shapes stay at 0 episodes with drops within mf.6's own
 run-to-run spread (8 senders + 2 burners: mf.6 1126–1793 vs 1126–1330); and
@@ -174,7 +188,7 @@ no reader at all, so the band's designed drops were invisible while
 caught up with the episode's drop count; `rnstatus` prints a `Dropped` line
 (count + whether the child is behind now) for a PipeInterface that has ever
 dropped a frame, from `get_interface_stats` keys `tx_dropped` /
-`tx_congested`. The same low-water mark gates recovery from a stall: the
+`tx_congested`. `TX_LOW_WATER` (`TX_QUEUE_DEPTH // 2` = 128) gates recovery from a stall: the
 interface comes back Up when a write completes AND the queue is at or below
 `TX_LOW_WATER`, so a slow child no longer flaps on every page — at the
 price of a longer Down: time-to-Up after a stall is about `TX_LOW_WATER`
@@ -183,7 +197,12 @@ frames ÷ the child's drain rate (~128 KB of 1 KB frames: measured 72 s at
 pass F2). If `select()` itself fails the pipe reads as NOT full — without
 evidence the interface keeps mf.6 back-pressure — and the failure is
 counted (`tx_probe_errors`, first one logged at DEBUG), so a permanently
-broken probe is not a permanently invisible one. Not changed: stall
+broken probe is not a permanently invisible one. The span start is read
+ONCE per timed-out put: the writer clears it without a lock, and a clear
+landing between a second read and the subtraction raised `TypeError` on the
+TX path (fresh pass on `925d275c`, F2 — replayed deterministically, 0 live
+hits in 9 runs; Transport would have logged it as an ERROR with the drop
+uncounted). Not changed: stall
 detection (still the drop path, still `TX_STALL_S` from the last completed
 write), queue depth, respawn. Known and bounded: during `configure_pipe`'s
 1 s join after a child death the retired writer may still take live-queue
@@ -191,10 +210,19 @@ frames into the dead child's pipe (≤ one pipe's worth). Tests (in
 `tests/meshforge_pipe_interface_stall.py`; congestion entry is recorded by a
 property spy, because a polling watcher thread is starved by the very
 contention under test; each leg of the gate has a test that fails when that
-leg is removed — span → 0: the paused-child and short-burst tests; `select`
-always "not full": the fast-rate test; `select` always "full": the
-starved-writer test): a child started with `slow` (200 B per 100 ms) — 100
-of 100 calls waited (2.01 s on the caller) on `5f9d0553` (= mf.6 code), now
+leg is removed, measured on this cut — span → 0: the paused-child,
+short-burst, quiet-gap and mid-sample tests; `select` always "not full": the
+fast-rate, gulp-child, episode-log and slow-child tests; `select` always
+"full": the starved-writer, both GIL tests, the paused-child and episode-log
+tests; the quiet-gap abandon rule deleted: the quiet-gap and mid-sample tests
+(fed explicit clocks; the fresh pass on `925d275c` found this leg unpinned,
+F3); the writer-side caught-up reset deleted: the paused-child test;
+caught-up reverted to "queue at low water": the gulp-child test only): a
+child started with `slow` (200 B per 100 ms) — on
+`5f9d0553` (= mf.6 code) the shipped test FAILS on the waits (the budget is
+computed with a `getattr` default so a tree without the gate fails on the
+property, not on the name — F4 of the same pass; the "100 of 100 waited,
+2.01 s" figure is what the `select`-always-"not-full" mutant produces), now
 ≤ `TX_CONGEST_FULL_S / TX_PUT_WAIT_S` + 1; SIGSTOP → offline → SIGCONT — Up
 with 256 frames still queued on mf.6, now ≤ 128; a HEALTHY child under 4
 senders + 1 CPU burner (red on `94cd084d`) and under 4 senders + 1 burner +
@@ -204,7 +232,12 @@ child draining 2 MB/s offered a 1 MB burst from 4 tight senders (both red on
 `6adfa33b`) must never enter it; a writer slowed to 30 ms per frame beside a
 fast child must never enter it; a child draining 200 kB/s offered 600 kB/s
 must enter it and cost the caller ≤ `TX_CONGEST_FULL_S / TX_PUT_WAIT_S` + 6
-waits (red on `a67be362`); an episode must log its entry and its exit with
+waits (red on `a67be362`); a child draining 200 kB/s in 1 MB gulps offered
+600 kB/s for 6 s must enter it ONCE (red on `925d275c`: 3 episodes, 96
+waits); the writer clearing the span start between the caller's two reads
+must not raise (red on `925d275c`: `TypeError`); a quiet gap longer than
+`TX_CONGEST_FULL_S` must restart the span (red when that rule is deleted);
+an episode must log its entry and its exit with
 the count, and `get_interface_stats` must carry `tx_dropped` /
 `tx_congested` (both red on `6adfa33b`). No wire or crypto change.
 

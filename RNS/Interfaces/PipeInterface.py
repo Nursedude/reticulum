@@ -82,8 +82,8 @@ class PipeInterface(Interface):
     # interface ran 8 s median / 20 s worst). Once puts have timed out with
     # the pipe full for TX_CONGEST_FULL_S the interface is congested: frames
     # are offered without waiting (dropped only if the queue is full) until
-    # the queue has drained to TX_LOW_WATER.
-    # The same mark gates recovery from a stall, so a child that frees a
+    # the child has caught up: queue EMPTY and pipe writable (_child_caught_up).
+    # TX_LOW_WATER gates recovery from a stall, so a child that frees a
     # pipe page less often than TX_STALL_S (16 KB pages at 2 kB/s: ~8 s)
     # does not flap Down/Up on every page.
     TX_LOW_WATER = TX_QUEUE_DEPTH // 2
@@ -113,9 +113,10 @@ class PipeInterface(Interface):
     # times out puts every TX_PUT_WAIT_S with the pipe full (the writer is
     # parked in flush() at every sample), so the span reaches the gate on
     # 16 KB and 4 KB pages alike. A span is abandoned when a timed-out put
-    # finds the pipe writable, when the writer drains the queue to
-    # TX_LOW_WATER (the burst was absorbed), or when no put has timed out
-    # for TX_CONGEST_FULL_S (the caller was being served).
+    # finds the pipe writable, when the writer finds the child caught up
+    # (queue empty AND pipe writable — the burst was absorbed; "queue at low
+    # water" was not that, see _child_caught_up), or when no put has timed
+    # out for TX_CONGEST_FULL_S (the caller was being served).
     TX_CONGEST_FULL_S = 0.5
 
     owner    = None
@@ -213,7 +214,7 @@ class PipeInterface(Interface):
     def process_outgoing(self,data):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-            if self._tx_congested and self._txq.qsize() <= PipeInterface.TX_LOW_WATER:
+            if self._tx_congested and self._child_caught_up():
                 self._tx_congested = False
                 self._tx_full_since = None
                 RNS.log(f"{self} subprocess has caught up; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
@@ -242,14 +243,30 @@ class PipeInterface(Interface):
         if not self._pipe_full():
             self._tx_full_since = None
             return
-        if self._tx_full_since is None or now - self._tx_full_last > PipeInterface.TX_CONGEST_FULL_S:
-            self._tx_full_since = now
+        # One read: the writer thread clears _tx_full_since without a lock,
+        # and a clear between a second read and the subtraction raised
+        # TypeError on the TX path (fresh pass on 925d275c, F2).
+        since = self._tx_full_since
+        if since is None or now - self._tx_full_last > PipeInterface.TX_CONGEST_FULL_S:
+            since = now
+        self._tx_full_since = since
         self._tx_full_last = now
-        full_for = now - self._tx_full_since
+        full_for = now - since
         if full_for >= PipeInterface.TX_CONGEST_FULL_S and not self._tx_congested:
             self._tx_congested = True
             self._tx_episode_dropped = self.tx_dropped
-            RNS.log(f"{self} subprocess is behind (stdin pipe full for {full_for:.2f}s); offering without waiting and dropping what the queue cannot hold until it drains to {PipeInterface.TX_LOW_WATER} frames", RNS.LOG_WARNING)
+            RNS.log(f"{self} subprocess is behind (stdin pipe full for {full_for:.2f}s); offering without waiting and dropping what the queue cannot hold until the queue is empty and the pipe has room", RNS.LOG_WARNING)
+
+    def _child_caught_up(self):
+        # Caught up means NOTHING is backed up: the queue is empty AND the
+        # kernel pipe has room. "Queue at low water" was not that: a child
+        # behind at a steady rate that reads in gulps (one os.read empties the
+        # 256 KB pipe) let the writer dump the whole queue into the emptied
+        # pipe — queue empty, pipe full again, child still behind — and the
+        # gate re-armed every cycle (fresh pass on 925d275c, F1: 9 episodes in
+        # 30 s, reader duty 0.31 vs 0.02). Checked by the writer after a
+        # write while a span is open, and by the caller while congested.
+        return self._txq.qsize() == 0 and not self._pipe_full()
 
     def _pipe_full(self):
         # The kernel's own fact, one non-blocking syscall per timed-out put
@@ -300,7 +317,7 @@ class PipeInterface(Interface):
             self._tx_last_drain = time.monotonic()
             # The burst was absorbed: a pipe-full span that began before it
             # does not carry into the next one.
-            if self._tx_full_since is not None and self._txq.qsize() <= PipeInterface.TX_LOW_WATER:
+            if self._tx_full_since is not None and self._child_caught_up():
                 self._tx_full_since = None
             if written != len(data):
                 RNS.log("Pipe interface only wrote "+str(written)+" bytes of "+str(len(data)), RNS.LOG_ERROR)
