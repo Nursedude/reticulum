@@ -304,7 +304,8 @@ once in 93 interleaved runs on this cut AND once in 93 on the cut without
 the waited-put sampling (1231/1487 of 2000 dropped; medians 28 vs 28): the
 0.5 s span can still be outlasted by a burst into an unscheduled child.
 Whether RNS ever emits > 512 KB that fast into a PipeInterface is
-unmeasured. 4 KB-page kernels remain unchecked (no box).
+unmeasured. 4 KB-page kernels: MEASURED RED on the 2026-10-12 canary — see
+the note below the non-author pass; mf.8 owed before any box runs this gate.
 
 **Non-author pass on `3182bd82` (2026-10-12, Fable 5.1; tests + this note
 only, code byte-identical):** (1) CLOSED — both legs were untested branches,
@@ -334,6 +335,33 @@ behaviour: `reconnect_pipe` never checks `detached`, so a detached interface
 respawns its child forever (the test run's `can't open file` /
 `ResourceWarning` noise, 150–400 lines per run). 4 KB pages: the lowwater
 test pins nothing there (the queue dump over-fills a 64 KB pipe) — UNKNOWN.
+
+**4 KB-page kernels, MEASURED 2026-10-12 (canary step, before any install;
+Fable 5.1, same non-author):** this tag's own stall file run from a clone on
+two Raspberry Pi 4s — moc4 (Python 3.11.2, kernel 6.12, load 0.2) and moc5
+(Python 3.13.5) — **FAILED 5/23, then 4/23, then 4/23**; the other 63
+`meshforge_*` tests pass. The same file is 20/20 on the Pi 5 (16 KB pages)
+every pass ran on. Seven of the fleet's nine RNS boxes are 4 KB pages (every
+Pi 3/4); the whole mf.6/mf.7 arc — build and six review passes — saw only
+16 KB. The failures, by weight: (1) `test_child_behind_faster_than_a_page_
+per_put_wait_still_congests`, both legs, every run: an 800 kB/s child **never
+enters congested mode and the caller waits 4.3–4.6 s of every 5 s** (210–230
+waits) — the mf.6 reader-saturation shape this release claims to cure. On a
+4 KB kernel a pipe page frees every ~5 ms at that rate, so the F2 post-wait
+sample reads writable and no span forms; the fix is page-size coupled where
+its comment says ~200 kB/s and the fleet's boxes sit above it. (2) gulp child,
+1000-B frames: 68–81 waits vs the two-span bound 56 (1.5–1.9 s of 6 s on the
+caller); the 500-B leg failed once in three. (3) `test_healthy_child_burst_
+drops_nothing`: 1 of 2000 dropped, every run — **mf.6's own stall file drops
+the same 1 on moc4** (control run of the `1.3.8+mf.6` tag: 1 of 5 FAIL), so
+this is a 4 KB property of the gate since mf.6, not an mf.7 regression; vs
+stock (which blocks) it is the known trade, but the test's claim is false
+there. The interpreter is ruled out (3.11 and 3.13 agree). Not installed
+anywhere: the MeshForge/MeshAnchor pin bump to mf.7/mf.10 was REVERTED the
+same hour (fleet == pin == mf.5/mf.8); this tag stays as history. Logs:
+manager `~/.local/share/meshforge/mf7-review-tools/canary-4k-2026-10-12/`.
+**mf.8 starts red-first from these three tests ON a 4 KB box** — a gate that
+reads the pipe must be reasoned in bytes-per-page-interval, not in pages.
 
 ### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
 
