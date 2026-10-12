@@ -102,7 +102,7 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### `1.3.8+mf.7` (UNRELEASED) — a PipeInterface child that is behind costs a forwarding reader one wait per congestion episode, and stops flapping
+### `1.3.8+mf.7` (2026-10-12) — a PipeInterface child that is behind costs a forwarding reader one wait per congestion episode, and stops flapping
 
 Transport-forwarding drill 2026-10-10 (three private instances: TCP client →
 router with `enable_transport = Yes` → PipeInterface → relay child → TCP →
