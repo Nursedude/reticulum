@@ -306,6 +306,35 @@ the waited-put sampling (1231/1487 of 2000 dropped; medians 28 vs 28): the
 Whether RNS ever emits > 512 KB that fast into a PipeInterface is
 unmeasured. 4 KB-page kernels remain unchecked (no box).
 
+**Non-author pass on `3182bd82` (2026-10-12, Fable 5.1; tests + this note
+only, code byte-identical):** (1) CLOSED — both legs were untested branches,
+not dead code. `noreset`: explicit clocks + the real writer — 0.4 S of full
+samples, a burst the writer absorbs, full samples again inside the quiet-gap
+window — must start a new span; the mutant congests on the sum at 1.1 S.
+`lowwater`: the band that tells the two caught-up rules apart is where the
+pipe refills before `TX_CONGEST_FULL_S` but the queue stays under low water
+past it — 500-B frames at 512–768 f/s (pipe free after a dump = 256 frames,
+low water at 384); measured at 600 f/s into a 200 kB/s gulp child, the
+low-water rule closed the episode twice in 10 s about a child 1.3 s behind
+(111 waits), queue-EMPTY-and-pipe-writable held it (30–39 waits). Each test
+kills only its own mutant; the whole matrix (6 mutants) re-run, all killed.
+(2) The bound-31 flake is the TEST: stall file ×20 on this cut 20/20 green,
+one 39 seen (on a mutant tree; author: one 40); 39 ≈ one span + a restarted
+partial span, the mechanism the gulp tests already price at two spans. The
+two fast-rate tests now use the same two-span bound; F2 unchanged. (3) No
+double count: stall → crash → respawn in one episode, `offered − written −
+dropped = 1` on both runs — the frame in the writer's hand when the pipe
+broke, lost uncounted (≤ 1 per crash), never negative. (4) Real packets: a
+private instance (`instance_name = mf7review`, 400-B PLAIN packets at
+1200 f/s into a 200 kB/s gulp child) — entry line at 0.52 s, `rnstatus`
+`Dropped : 3273 frame(s) (child behind, dropping now)`, SIGKILL mid-episode
+→ `respawned mid-episode; 3303 frame(s) dropped during the episode, 3323
+total` → `Reconnected pipe`, congested False. Still open, pre-existing stock
+behaviour: `reconnect_pipe` never checks `detached`, so a detached interface
+respawns its child forever (the test run's `can't open file` /
+`ResourceWarning` noise, 150–400 lines per run). 4 KB pages: the lowwater
+test pins nothing there (the queue dump over-fills a 64 KB pipe) — UNKNOWN.
+
 ### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
 
 Stock `PipeInterface.process_outgoing()` does a blocking `stdin.write()` on

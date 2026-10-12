@@ -351,9 +351,15 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertGreater(self.iface.tx_dropped, 0, "the child was never behind; the shape is vacuous")
         self.assertNotEqual(entered, [], "a child that was behind never entered congested mode")
         # The gate's own cost, once: TX_CONGEST_FULL_S of waits before the
-        # episode opens (one caller: ~25), then none until low water.
-        allowed = int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
-        self.assertLessEqual(waits, allowed, f"{waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed})")
+        # episode opens (one caller: ~25), then none until low water. Up to
+        # TWO spans, as in the gulp tests: a waited put whose slot comes the
+        # instant the child frees a page reads the pipe writable and restarts
+        # the span — correctly, the child was not behind at that sample — and
+        # the partial span is paid again (non-author pass on 3182bd82: 39 and
+        # 40 waits seen against a one-span bound of 31, 0 of 20 soak runs
+        # otherwise; a re-arming gate costs a span per cycle, far above this).
+        allowed = 2 * int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
+        self.assertLessEqual(waits, allowed, f"{waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed} once)")
 
     def test_child_behind_faster_than_a_page_per_put_wait_still_congests(self):
         """Fresh pass on b18aae01, F2: a child behind at a rate that frees a
@@ -385,8 +391,9 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         # a tree that misses it: the caller's waits are the vacuity witness.
         self.assertGreater(waits + self.iface.tx_dropped, 0, f"{size}-B frames: the caller never waited and nothing dropped; the child was never behind and the shape is vacuous")
         self.assertNotEqual(entered, [], f"{size}-B frames: a child behind at 800 kB/s never entered congested mode ({waits} waits, {busy:.2f}s of 5s on the caller, {self.iface.tx_dropped} dropped)")
-        allowed = int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
-        self.assertLessEqual(waits, allowed, f"{size}-B frames: {waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed})")
+        # Two spans, once — see test_child_behind_at_a_fast_rate_still_congests.
+        allowed = 2 * int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
+        self.assertLessEqual(waits, allowed, f"{size}-B frames: {waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed} once)")
 
     def test_starved_writer_with_a_draining_child_never_congests(self):
         """The kernel-fact leg of the gate, pinned on its own: a queue that
@@ -606,6 +613,35 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         allowed = 2 * int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
         self.assertLessEqual(waits, allowed, f"{size}-B frames: {waits} calls waited for a slot ({busy:.2f}s of 6s on the caller; the gate allows {allowed} once)")
 
+    def test_gulp_child_behind_with_the_queue_under_low_water_stays_congested(self):
+        """Non-author pass on 3182bd82 (2026-10-12): the pipe half of the
+        caught-up rule had no test of its own — `qsize() <= TX_LOW_WATER` in
+        _child_caught_up passed the whole file (the 1200 f/s gulp twins refill
+        the queue past low water within ~0.3 s of a dump, so both rules hold
+        the episode). The band that tells them apart: after a gulp empties
+        the pipe and the writer dumps the queue, 500-B offers refill the
+        pipe's free 256 frames in 256/rate s and carry the queue past 128 at
+        384/rate s; between 512 and 768 f/s the pipe is full again BEFORE
+        TX_CONGEST_FULL_S while the queue is still under low water AFTER it.
+        Measured at 600 f/s (300 kB/s into a 200 kB/s child): the low-water
+        rule closed the episode twice in 10 s about a child 1.3 s behind
+        (111 waits); queue EMPTY and pipe writable held it (30-39 waits).
+        Pinned on this kernel's 16 KB pages / 256 KB pipe; on 4 KB pages the
+        queue dump does not fit the pipe and this shape pins nothing."""
+        self._swap_iface({"name": "gulp", "command": self.cfg["command"] + " gulp 200000"})
+        entered = self._spy_congestion()
+        waits = 0
+        t_end = time.monotonic() + 10.0; k = 0; t0 = time.monotonic()
+        while time.monotonic() < t_end:
+            k += 1
+            t = time.monotonic(); self.iface.process_outgoing(b"g" * 500)
+            if time.monotonic() - t >= 0.015: waits += 1
+            rem = t0 + k / 600.0 - time.monotonic()
+            if rem > 0: time.sleep(rem)
+        self.assertGreater(self.iface.tx_dropped, 0, "the child was never behind; the shape is vacuous")
+        self.assertNotEqual(entered, [], "a child that was behind never entered congested mode")
+        self.assertEqual(len(entered), 1, f"congested {len(entered)}x in 10 s: the episode closed on a child still behind ({waits} waits)")
+
     def test_span_start_cleared_by_the_writer_mid_sample_does_not_raise(self):
         """Fresh pass on 925d275c, F2: `_note_pipe_full` read the span start
         twice — `is None`, then the subtraction — and the writer thread clears
@@ -647,6 +683,39 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertFalse(self.iface._tx_congested, "a span survived a quiet gap longer than TX_CONGEST_FULL_S")
         self.iface._note_pipe_full(t0 + 3.5 * S)
         self.assertTrue(self.iface._tx_congested, "a child behind for 1.1 spans after the gap did not congest")
+
+    def test_a_burst_the_writer_absorbed_ends_the_span(self):
+        """Non-author pass on 3182bd82 (2026-10-12): the writer's own abandon
+        rule — after a completed write with the queue empty and the pipe
+        writable, an open pipe-full span is cleared — had no test; with it
+        deleted (`if False:`) the file passed 21/21, because every other shape
+        also fed a waited put that found the pipe writable (the caller's rule)
+        before the span could matter. Here no put waits between two short
+        spans: 0.4 S of full samples, the burst absorbed by the real writer,
+        then full samples again inside the quiet-gap window. The second span
+        starts fresh; without the rule the two sum and congest at 1.1 S."""
+        S = PI.PipeInterface.TX_CONGEST_FULL_S
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        t0 = time.monotonic()
+        for f in (0.0, 0.2, 0.4): self.iface._note_pipe_full(t0 + f * S)
+        self.assertIsNotNone(self.iface._tx_full_since)
+        # the burst is absorbed: the writer's next completed write finds the
+        # queue empty and the pipe writable
+        full[0] = False
+        txb0 = self.iface.txb
+        self.iface.process_outgoing(b"a" * 500)
+        deadline = time.monotonic() + 5
+        while self.iface.txb == txb0 and time.monotonic() < deadline: time.sleep(0.005)
+        self.assertGreater(self.iface.txb, txb0, "the writer never wrote the frame")
+        time.sleep(0.05)   # the writer's post-write check runs after txb is bumped
+        full[0] = True
+        self.iface._note_pipe_full(t0 + 1.1 * S)
+        self.assertFalse(self.iface._tx_congested, "congested on the sum of two spans separated by an absorbed burst")
+        self.iface._note_pipe_full(t0 + 1.5 * S)
+        self.assertFalse(self.iface._tx_congested, "the span that began at 1.1 S is only 0.4 S old")
+        self.iface._note_pipe_full(t0 + 2.2 * S)
+        self.assertTrue(self.iface._tx_congested, "a span 1.1 S old did not congest (the shape is vacuous)")
 
     def test_interface_stats_carry_dropped_and_congested(self):
         """Same finding, the rnstatus half: `get_interface_stats` must expose
