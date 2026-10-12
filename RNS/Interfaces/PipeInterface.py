@@ -79,17 +79,25 @@ class PipeInterface(Interface):
     # it is offered keeps completing writes, so the stall check never fires,
     # and a wait on every frame saturated that reader (transport-forwarding
     # drill 2026-10-10: 100 f/s x 20 ms; control traffic on the arriving TCP
-    # interface ran 8 s median / 20 s worst). Once puts have timed out with
+    # interface ran 8 s median / 20 s worst). Once puts have waited with
     # the pipe full for TX_CONGEST_FULL_S the interface is congested: frames
     # are offered without waiting (dropped only if the queue is full) until
-    # the child has caught up: queue EMPTY and pipe writable (_child_caught_up).
+    # the child has caught up: queue EMPTY and pipe writable (_child_caught_up)
+    # across TX_CONGEST_FULL_S of offers — exit needs persistent evidence, as
+    # entry does. One caught-up sample was true with the child 1.3 s behind
+    # whenever the queue dump fit in the emptied pipe: 502-B frames pack 32
+    # to a 16 KB page, so 256 frames fill 8 of 16 pages and select() reads
+    # writable, and the gate re-armed every ~1.3 s (fresh pass on b18aae01,
+    # F1: 14 episodes / 368 waits / reader duty 0.38 in 20 s vs 6adfa33b 16
+    # waits). A child that is behind refills the queue from the offered
+    # stream within ~0.2 s of the dump; it cannot keep it empty for 0.5 s.
     # TX_LOW_WATER gates recovery from a stall, so a child that frees a
     # pipe page less often than TX_STALL_S (16 KB pages at 2 kB/s: ~8 s)
     # does not flap Down/Up on every page.
     TX_LOW_WATER = TX_QUEUE_DEPTH // 2
     # A put timeout is evidence of a child that is BEHIND only when the
     # kernel says so — the pipe is not writable (full) — AND has said so
-    # across TX_CONGEST_FULL_S of timed-out puts. Three cuts used weaker
+    # across TX_CONGEST_FULL_S of puts that waited or timed out. Three cuts used weaker
     # evidence and each fresh pass broke it: any timeout (94cd084d) congested
     # a healthy child whose writer had not been scheduled; a clock on the
     # writer's write call (a67be362) counted the GIL re-acquire after the
@@ -109,14 +117,19 @@ class PipeInterface(Interface):
     # a 512 KB buffer should smooth. So the reader is held (one wait per
     # TX_PUT_WAIT_S, at most TX_CONGEST_FULL_S per episode) before frames are
     # dropped: far below TX_STALL_S and the 8 s saturation measured on mf.6,
-    # far above scheduler latency on a loaded Pi. A child behind at ANY rate
-    # times out puts every TX_PUT_WAIT_S with the pipe full (the writer is
-    # parked in flush() at every sample), so the span reaches the gate on
-    # 16 KB and 4 KB pages alike. A span is abandoned when a timed-out put
+    # far above scheduler latency on a loaded Pi. The pipe is sampled on
+    # every put that WAITED for its slot (>= TX_PUT_WAIT_S / 2), not only on
+    # one that timed out: a child behind at a rate that frees a page within
+    # TX_PUT_WAIT_S (16 KB / 20 ms = 800 kB/s on 16 KB pages, ~200 kB/s on
+    # 4 KB pages) lets every put succeed after a wait, so sampling only on
+    # timeouts never opened a span and the caller paid a wait per frame as on
+    # mf.6 (fresh pass on b18aae01, F2: 0 episodes, reader duty 0.917). A
+    # healthy child whose writer is merely slow leaves the pipe writable at
+    # those samples, which abandons the span. A span is abandoned when a put
     # finds the pipe writable, when the writer finds the child caught up
     # (queue empty AND pipe writable — the burst was absorbed; "queue at low
-    # water" was not that, see _child_caught_up), or when no put has timed
-    # out for TX_CONGEST_FULL_S (the caller was being served).
+    # water" was not that, see _child_caught_up), or when no put has waited
+    # or timed out for TX_CONGEST_FULL_S (the caller was being served).
     TX_CONGEST_FULL_S = 0.5
 
     owner    = None
@@ -155,6 +168,7 @@ class PipeInterface(Interface):
         self._tx_congested = False
         self._tx_full_since = None
         self._tx_full_last = 0.0
+        self._tx_clear_since = None
         self._tx_episode_dropped = 0
         self._writer_gen = 0
         self._writer = None
@@ -196,9 +210,15 @@ class PipeInterface(Interface):
         if self._writer is not None and self._writer.is_alive():
             self._writer.join(1.0)
         self._tx_last_drain = time.monotonic()
+        if self._tx_congested:
+            # The child died mid-episode: the episode ends here, and leaves
+            # the same witness as one the child ends by catching up (fresh
+            # pass on b18aae01, F3: 2 of 3 respawned episodes had no line).
+            RNS.log(f"{self} subprocess respawned mid-episode; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
         self._tx_stalled = False
         self._tx_congested = False
         self._tx_full_since = None
+        self._tx_clear_since = None
         self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
                                         name=f"pipe-writer-{self.name}")
         self._writer.start()
@@ -214,19 +234,32 @@ class PipeInterface(Interface):
     def process_outgoing(self,data):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-            if self._tx_congested and self._child_caught_up():
+            if self._tx_congested and self._caught_up_for(time.monotonic()):
                 self._tx_congested = False
                 self._tx_full_since = None
+                self._tx_clear_since = None
                 RNS.log(f"{self} subprocess has caught up; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
             try:
                 if self._tx_congested: self._txq.put_nowait(data)
-                else: self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
+                else:
+                    t = time.monotonic()
+                    self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
+                    now = time.monotonic()
+                    # Waited for the slot and got it: the same evidence as a
+                    # timed-out put if the pipe is full (see TX_CONGEST_FULL_S).
+                    if now - t >= PipeInterface.TX_PUT_WAIT_S / 2: self._note_pipe_full(now)
             except queue.Full:
+                # The queue is not empty: whatever caught-up run was open is over.
+                self._tx_clear_since = None
                 self._note_pipe_full(time.monotonic())
                 self.tx_dropped += 1
                 self._check_tx_stall()
-        elif self._tx_stalled:
-            # Offered while stalled: counted, so the recovery line is honest.
+        else:
+            # Offered while offline — stalled, a dead child, the respawn
+            # window: every refused offer is a drop and is counted, so the
+            # recovery and episode lines are honest (fresh pass on b18aae01,
+            # F3: only the stalled case counted; 1363 frames vanished in a
+            # respawn drill).
             self.tx_dropped += 1
 
     @property
@@ -238,7 +271,7 @@ class PipeInterface(Interface):
         return self._tx_congested
 
     def _note_pipe_full(self, now):
-        # Called on a timed-out put. One pipe-full sample is not evidence the
+        # Called on a put that waited or timed out. One pipe-full sample is not evidence the
         # child is behind (see TX_CONGEST_FULL_S); a span of them is.
         if not self._pipe_full():
             self._tx_full_since = None
@@ -254,8 +287,23 @@ class PipeInterface(Interface):
         full_for = now - since
         if full_for >= PipeInterface.TX_CONGEST_FULL_S and not self._tx_congested:
             self._tx_congested = True
+            self._tx_clear_since = None
             self._tx_episode_dropped = self.tx_dropped
-            RNS.log(f"{self} subprocess is behind (stdin pipe full for {full_for:.2f}s); offering without waiting and dropping what the queue cannot hold until the queue is empty and the pipe has room", RNS.LOG_WARNING)
+            RNS.log(f"{self} subprocess is behind (stdin pipe full for {full_for:.2f}s); offering without waiting and dropping what the queue cannot hold until the queue has stayed empty and the pipe has had room for {PipeInterface.TX_CONGEST_FULL_S:.1f}s", RNS.LOG_WARNING)
+
+    def _caught_up_for(self, now):
+        # Called by the caller (the only thread that knows whether a put
+        # timed out) on every offer while congested: True once the child has
+        # been caught up across TX_CONGEST_FULL_S of consecutive offers. Any
+        # sample that is not caught up, or a put that finds the queue full,
+        # restarts the run. One constant for entry and exit (hfm #5).
+        if not self._child_caught_up():
+            self._tx_clear_since = None
+            return False
+        since = self._tx_clear_since
+        if since is None:
+            self._tx_clear_since = since = now
+        return now - since >= PipeInterface.TX_CONGEST_FULL_S
 
     def _child_caught_up(self):
         # Caught up means NOTHING is backed up: the queue is empty AND the
@@ -269,8 +317,8 @@ class PipeInterface(Interface):
         return self._txq.qsize() == 0 and not self._pipe_full()
 
     def _pipe_full(self):
-        # The kernel's own fact, one non-blocking syscall per timed-out put
-        # (which already cost TX_PUT_WAIT_S). Unobservable reads as NOT
+        # The kernel's own fact, one non-blocking syscall per put that waited
+        # (which already cost >= TX_PUT_WAIT_S / 2). Unobservable reads as NOT
         # full: without evidence the interface keeps mf.6 back-pressure.
         # Every error shape (process None, stdin None/closed, dead child,
         # non-pipe fd) lands here (fresh pass on 6adfa33b, F5) — counted so

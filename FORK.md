@@ -118,12 +118,15 @@ every ~8 s: on a 16 KB-page kernel the writer gets room only when the child
 has consumed a whole page (16 KB ÷ 2 kB/s > `TX_STALL_S`), and the first
 completed write flipped it back with the queue still full. A SIGSTOPped
 child was fine (1.23 s worst, ×2); stock was worse in every shape (rnsd's
-own announcing thread froze). Cure: when puts have timed out while the
-KERNEL reports the pipe full (`select()` says not writable — the writer is
+own announcing thread froze). Cure: when puts have waited for a slot (or
+timed out) while the KERNEL reports the pipe full (`select()` says not writable — the writer is
 parked in `flush()`) for `TX_CONGEST_FULL_S` (0.5 s), the interface is
 CONGESTED — frames are offered with `put_nowait` (dropped and counted only
 if the queue is full) until the child has CAUGHT UP: the queue is empty AND
-the kernel pipe has room (`_child_caught_up`). A caller pays at most `TX_CONGEST_FULL_S` of
+the kernel pipe has room (`_child_caught_up`), and has STAYED so across
+`TX_CONGEST_FULL_S` of offers with no put finding the queue full
+(`_caught_up_for` — exit needs persistent evidence, as entry does; one
+constant for both). A caller pays at most `TX_CONGEST_FULL_S` of
 waits per episode (one caller: ~25 × 20 ms; measured 27 in a 5 s run at
 200 kB/s drained / 600 f/s offered, where mf.6 paid 187, i.e. 75 % of the
 caller's time, for the run's whole length), then none. Congested mode has
@@ -150,10 +153,10 @@ of samples dropped 1220–1487 the same way. What separates a burst from the
 overload this cure is for is DURATION, so the gate is a span of pipe-full
 timeouts, 0.5 s: far above scheduler latency on a loaded Pi, far below
 `TX_STALL_S` (5 s) and the 8 s saturation measured on mf.6. The span is
-abandoned when a timed-out put finds the pipe writable (the writer is not
+abandoned when a put that waited or timed out finds the pipe writable (the writer is not
 blocked — a starved writer is not a child behind), when the writer finds the
 child caught up (queue empty AND pipe writable — the burst was absorbed), or
-when no put has timed out for `TX_CONGEST_FULL_S`. "Caught up" was first cut
+when no put has waited or timed out for `TX_CONGEST_FULL_S`. "Caught up" was first cut
 as "the queue drained to `TX_LOW_WATER`" (128 frames) and the fresh pass on
 `925d275c` broke it (F1): a child that is behind at a steady rate but reads
 in GULPS — one `os.read` of a large buffer empties the whole 256 KB pipe —
@@ -167,14 +170,40 @@ coupled (128 KB of low water is below a 256 KB pipe on 16 KB pages; on a
 4 KB-page kernel the 64 KB pipe cannot free 128 slots in one gulp, so that
 leg could not fire that way there). With caught-up = queue EMPTY and pipe
 WRITABLE the same shape is 1 episode that never closes, 44 waits, duty 0.03,
-bytes delivered unchanged (6 372 720 B). With this gate the `nice 10` shape reads
+bytes delivered unchanged (6 372 720 B) — but only at 1000-B frames, and the
+fresh pass on `b18aae01` broke it (F1): a pipe write merges into the last
+page only if it fits, so 1002-B frames pack 16 to a 16 KB page and the
+256-frame queue dump fills all 16 pages (not writable — right by
+coincidence), while 502-B frames (the RNS MTU) pack 32 to a page, the dump
+fills 8 of 16, `select()` reads writable with the child 1.3 s behind, and
+the gate re-armed every ~1.3 s: gulp child at 500 B / 1200 f/s for 20 s,
+14–15 episodes, 368–393 waits, reader duty 0.38–0.41 (6adfa33b: 16 waits,
+0.027). One caught-up SAMPLE is not evidence; a run of them is: a child
+behind refills the queue from the offered stream within ~0.2 s of the dump
+and cannot keep it empty for 0.5 s. With the exit duration the same shape is
+1 episode, 35–36 waits, duty 0.05, bytes delivered unchanged (4 105 858 B
+vs 4 079 252–4 106 862 B on `b18aae01`), and the 1000-B shapes are
+unchanged (1 episode, 26 waits). The earlier "sound on 4 KB pages, broken
+on 16 KB" reading is inverted: the single-sample rule held on 4 KB pages
+(a 64 KB pipe is always over-filled by the dump) and broke on 16 KB pages
+at frames under ~910 B. Every test and drill in this file now offers 500-B
+frames first, 1000 B second. With this gate the `nice 10` shape reads
 as mf.6 (11–23 dropped vs 13–54, 0 episodes, three interleaved pairs); the
 GIL-contention shapes stay at 0 episodes with drops within mf.6's own
 run-to-run spread (8 senders + 2 burners: mf.6 1126–1793 vs 1126–1330); and
-a child genuinely behind still congests on 16 KB and 4 KB pages alike,
-because a child behind at any rate times out puts every `TX_PUT_WAIT_S`
-with the writer parked in `flush()` (100 % of 1501 samples per 5 s run at
-200 kB/s). The trade, stated: once a child is behind for 0.5 s, the excess
+a child behind at 200 kB/s congests because it times out puts every
+`TX_PUT_WAIT_S` with the writer parked in `flush()` (100 % of 1501 samples
+per 5 s run). A child behind at a FASTER rate did not (fresh pass on
+`b18aae01`, F2): when it frees a page within `TX_PUT_WAIT_S` (16 KB / 20 ms
+= 800 kB/s on 16 KB pages; ~200 kB/s on 4 KB pages) every put waits up to
+20 ms and then SUCCEEDS, no put times out, the pipe was never sampled, and
+the caller paid a wait per frame as on mf.6 (800 kB/s child offered
+1.2 MB/s: 0 episodes, 186–187 waits, duty 0.76). The pipe is now sampled on
+every put that WAITED ≥ `TX_PUT_WAIT_S / 2` as well: 1 episode, 25–43
+waits, duty 0.12–0.19, delivered 4 041 050–4 051 070 B vs 4 007 046–
+4 041 050 B (the ~1530 extra drops are the frames mf.6 held back upstream,
+as below). A healthy child whose writer is merely slow leaves the pipe
+writable at those samples. The trade, stated: once a child is behind for 0.5 s, the excess
 is dropped at the pipe instead of stalling the reader that offered it — at
 200 kB/s drained / 300 kB/s offered, 1016 frames dropped in 15 s vs 374
 when the reader was held back (and every other frame on that reader with
@@ -185,7 +214,11 @@ the extra drops are exactly the frames mf.6 held back upstream. Every
 episode leaves a witness (fresh pass on `6adfa33b`, F3 — `tx_dropped` had
 no reader at all, so the band's designed drops were invisible while
 `rnstatus` read Up): one WARNING when the child is behind, one when it has
-caught up with the episode's drop count; `rnstatus` prints a `Dropped` line
+caught up — or when a respawn ends the episode ("respawned mid-episode",
+fresh pass on `b18aae01`, F3: 2 of 3 respawned episodes had no closing
+line) — with the episode's drop count; every offer refused while the
+interface is offline is counted in `tx_dropped`, not only those refused
+while stalled (same F3: 1363 frames vanished uncounted in a respawn drill); `rnstatus` prints a `Dropped` line
 (count + whether the child is behind now) for a PipeInterface that has ever
 dropped a frame, from `get_interface_stats` keys `tx_dropped` /
 `tx_congested`. `TX_LOW_WATER` (`TX_QUEUE_DEPTH // 2` = 128) gates recovery from a stall: the
@@ -204,7 +237,8 @@ TX path (fresh pass on `925d275c`, F2 — replayed deterministically, 0 live
 hits in 9 runs; Transport would have logged it as an ERROR with the drop
 uncounted). Not changed: stall
 detection (still the drop path, still `TX_STALL_S` from the last completed
-write), queue depth, respawn. Known and bounded: during `configure_pipe`'s
+write), queue depth, respawn (beyond the episode line and the offline
+count above). Known and bounded: during `configure_pipe`'s
 1 s join after a child death the retired writer may still take live-queue
 frames into the dead child's pipe (≤ one pipe's worth). Tests (in
 `tests/meshforge_pipe_interface_stall.py`; congestion entry is recorded by a
@@ -217,7 +251,11 @@ fast-rate, gulp-child, episode-log and slow-child tests; `select` always
 tests; the quiet-gap abandon rule deleted: the quiet-gap and mid-sample tests
 (fed explicit clocks; the fresh pass on `925d275c` found this leg unpinned,
 F3); the writer-side caught-up reset deleted: the paused-child test;
-caught-up reverted to "queue at low water": the gulp-child test only): a
+caught-up reverted to "queue at low water": the gulp-child test only —
+superseded on the `b18aae01` follow-up cut, see "Open" below; the exit
+duration → 0: the 500-B gulp test; waited-put sampling removed: the
+800 kB/s test at both sizes; the offline counter reverted: the crash test;
+the respawn episode line removed: the crash test): a
 child started with `slow` (200 B per 100 ms) — on
 `5f9d0553` (= mf.6 code) the shipped test FAILS on the waits (the budget is
 computed with a `getattr` default so a tree without the gate fails on the
@@ -234,12 +272,39 @@ fast child must never enter it; a child draining 200 kB/s offered 600 kB/s
 must enter it and cost the caller ≤ `TX_CONGEST_FULL_S / TX_PUT_WAIT_S` + 6
 waits (red on `a67be362`); a child draining 200 kB/s in 1 MB gulps offered
 600 kB/s for 6 s must enter it ONCE (red on `925d275c`: 3 episodes, 96
-waits); the writer clearing the span start between the caller's two reads
+waits) and so must the same child offered 500-B frames at 1200 f/s (red on
+`b18aae01`: 3–4 episodes, 91–104 waits; the wait bound for both is two
+spans + 6, because a gulp inside the first span correctly restarts it —
+measured 36 waits with and without the waited-put sampling); a child
+draining 800 kB/s offered 1.2 MB/s at 500 B and at 1000 B must enter it
+(red on `b18aae01`: 0 episodes, 187–203 waits, caller busy ~80 %); offers
+made while offline after a SIGKILL mid-episode must all be counted and the
+episode must close with a line (red on `b18aae01`: 50 refused, 0 counted,
+no line); the writer clearing the span start between the caller's two reads
 must not raise (red on `925d275c`: `TypeError`); a quiet gap longer than
 `TX_CONGEST_FULL_S` must restart the span (red when that rule is deleted);
 an episode must log its entry and its exit with
 the count, and `get_interface_stats` must carry `tx_dropped` /
 `tx_congested` (both red on `6adfa33b`). No wire or crypto change.
+
+**Open on the `b18aae01` follow-up cut (built by its author; a FRESH pass is
+owed before any tag):** (1) two legs are now unpinned — mutants `noreset`
+(writer-side caught-up span reset deleted) and `lowwater` (caught-up
+reverted to "queue at low water") both pass the stall file 21/21: the exit
+duration now carries the gulp shape alone, and writable samples from waited
+puts now abandon the paused-child span. BELIEVED still meaningful (a span
+can survive an absorbed burst when no put waits in between); no test shows
+it. (2) waited-put sampling can lengthen ENTRY: a waited put that lands
+just after the child frees a page reads writable and restarts the span —
+steady band (200 kB/s, 1000 B @ 600 f/s) measured 26 and 40 waits on this
+cut vs 26–27 on `b18aae01`; the fast-rate test allows 31 and passed in all
+six stall-file runs, so it is BELIEVED flaky, not observed flaky. (3) a
+healthy `nice 10` child beside 12 burners offered a 2 MB burst congested
+once in 93 interleaved runs on this cut AND once in 93 on the cut without
+the waited-put sampling (1231/1487 of 2000 dropped; medians 28 vs 28): the
+0.5 s span can still be outlasted by a burst into an unscheduled child.
+Whether RNS ever emits > 512 KB that fast into a PipeInterface is
+unmeasured. 4 KB-page kernels remain unchecked (no box).
 
 ### `1.3.8+mf.6` (2026-10-10) — a PipeInterface child that stops draining costs that interface, not rnsd
 

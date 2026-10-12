@@ -9,6 +9,12 @@
 # the child has not drained for TX_STALL_S (rnstatus reads Down, callers never
 # block), and back to True once it drains again. The child is a real
 # subprocess SIGSTOPped/SIGCONTed by the test.
+#
+# Frame size (fresh pass on b18aae01, F1): offer 500-B payloads by default —
+# the RNS MTU, and what the fleet actually sends — with 1000 B as the second
+# point. Pipe pages pack whole writes, so a rule can be right at 1000 B by
+# coincidence (16 frames fill a 16 KB page exactly) and wrong at 500 B; a
+# shape tested at one size pins that size, not the rule.
 import fcntl
 import os
 import signal
@@ -349,6 +355,39 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         allowed = int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
         self.assertLessEqual(waits, allowed, f"{waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed})")
 
+    def test_child_behind_faster_than_a_page_per_put_wait_still_congests(self):
+        """Fresh pass on b18aae01, F2: a child behind at a rate that frees a
+        pipe page within TX_PUT_WAIT_S (16 KB / 20 ms = 800 kB/s on 16 KB
+        pages; ~200 kB/s on 4 KB pages) never lets a put TIME OUT — every put
+        waits up to 20 ms and then succeeds — so the pipe was never sampled,
+        no span opened, and the caller paid a wait on nearly every frame
+        exactly as on mf.6 (reviewer: 0 episodes, 685 waits, reader duty
+        0.917). A put that waited for its slot and found the pipe full is the
+        same evidence as one that timed out. 500 B at 2400 f/s (the RNS MTU)
+        and 1000 B at 1200 f/s: both 1.2 MB/s into an 800 kB/s child."""
+        for size, rate_fs in ((500, 2400.0), (1000, 1200.0)):
+            with self.subTest(size=size):
+                self._assert_fast_child_congests(size, rate_fs)
+
+    def _assert_fast_child_congests(self, size, rate_fs):
+        self._swap_iface({"name": f"fast{size}", "command": self.cfg["command"] + " rate 800000"})
+        entered = self._spy_congestion()
+        waits = 0; busy = 0.0
+        t_end = time.monotonic() + 5.0; k = 0; t0 = time.monotonic()
+        while time.monotonic() < t_end:
+            k += 1
+            t = time.monotonic(); self.iface.process_outgoing(b"f" * size); dt = time.monotonic() - t
+            busy += dt
+            if dt >= 0.015: waits += 1
+            rem = t0 + k / rate_fs - time.monotonic()
+            if rem > 0: time.sleep(rem)
+        # In this band puts SUCCEED after waiting, so tx_dropped may stay 0 on
+        # a tree that misses it: the caller's waits are the vacuity witness.
+        self.assertGreater(waits + self.iface.tx_dropped, 0, f"{size}-B frames: the caller never waited and nothing dropped; the child was never behind and the shape is vacuous")
+        self.assertNotEqual(entered, [], f"{size}-B frames: a child behind at 800 kB/s never entered congested mode ({waits} waits, {busy:.2f}s of 5s on the caller, {self.iface.tx_dropped} dropped)")
+        allowed = int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
+        self.assertLessEqual(waits, allowed, f"{size}-B frames: {waits} calls waited for a slot ({busy:.2f}s of 5s on the caller; the gate allows {allowed})")
+
     def test_starved_writer_with_a_draining_child_never_congests(self):
         """The kernel-fact leg of the gate, pinned on its own: a queue that
         stays full for longer than TX_CONGEST_FULL_S because the WRITER is
@@ -461,15 +500,60 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
             self.assertTrue(getattr(self.iface, "tx_congested", False), "the child was never behind; the shape is vacuous")
             entry = [l for l in lines if "behind" in l]
             self.assertEqual(len(entry), 1, lines)
-            # Stop offering: 256 queued frames drain at 200 f/s in ~1.3 s; the
-            # next offer notices the low-water mark and closes the episode.
+            # Stop offering: 256 queued frames drain at 200 f/s in ~1.3 s. The
+            # episode closes only after the child has stayed caught up across
+            # TX_CONGEST_FULL_S of offers (fresh pass on b18aae01, F1), so
+            # offer slowly for twice that: 20 frames at 50 ms, 20 kB/s.
             time.sleep(2.0)
-            self.iface.process_outgoing(b"f" * 1000)
+            for _ in range(int(2 * PI.PipeInterface.TX_CONGEST_FULL_S / 0.05)):
+                self.iface.process_outgoing(b"f" * 1000)
+                time.sleep(0.05)
             self.assertFalse(getattr(self.iface, "tx_congested", False))
             exit_ = [l for l in lines if "caught up" in l]
             self.assertEqual(len(exit_), 1, lines)
             self.assertIn("dropped during the episode", exit_[0])
         self.assertTrue(self.iface.online)
+
+    def test_offers_while_offline_after_a_crash_are_counted_and_the_episode_closes(self):
+        """Fresh pass on b18aae01, F3 (pre-existing since mf.6): offers made
+        while `online` is False for any reason but a stall — a dead child, the
+        respawn window — were discarded with no counter (1363 frames in the
+        reviewer's respawn drill), and a respawn ended an open congestion
+        episode silently (2 of 3 episodes had no closing line). Every refused
+        offer is a drop and counts; an episode a respawn ends leaves a line
+        with its count, like one the child ends by catching up."""
+        self._swap_iface({"name": "crash", "command": self.cfg["command"] + " rate 200000", "respawn_delay": "1"})
+        lines = []
+        real_log = RNS.log
+        def spy(msg, *a, **k):
+            if str(self.iface) in str(msg): lines.append(str(msg))
+            return real_log(msg, *a, **k)
+        with mock.patch.object(RNS, "log", spy):
+            t_end = time.monotonic() + 3.0; k = 0; t0 = time.monotonic()
+            while time.monotonic() < t_end and not getattr(self.iface, "tx_congested", False):
+                k += 1; self.iface.process_outgoing(b"c" * 500)
+                rem = t0 + k / 1200.0 - time.monotonic()
+                if rem > 0: time.sleep(rem)
+            self.assertTrue(getattr(self.iface, "tx_congested", False), "the child was never behind; the shape is vacuous")
+            old_pid = self.iface.process.pid
+            os.kill(old_pid, signal.SIGKILL)
+            # Offer at 50 f/s through the crash and the respawn window; count
+            # only offers made with `online` False both before and after the
+            # call, so a respawn landing mid-call cannot be miscounted.
+            d0 = self.iface.tx_dropped; offline = 0
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and (self.iface.process.pid == old_pid or not self.iface.online):
+                before = self.iface.online
+                self.iface.process_outgoing(b"c" * 500)
+                if not before and not self.iface.online: offline += 1
+                time.sleep(0.02)
+            self.assertNotEqual(self.iface.process.pid, old_pid, "child was not respawned")
+            self.assertGreater(offline, 0, "no offer landed while offline; the shape is vacuous")
+            self.assertGreaterEqual(self.iface.tx_dropped - d0, offline,
+                                    f"{offline} offers were refused while offline but tx_dropped grew by {self.iface.tx_dropped - d0}")
+            self.assertFalse(getattr(self.iface, "tx_congested", False), "a respawned child inherited the dead child's episode")
+            closed = [l for l in lines if "dropped during the episode" in l]
+            self.assertEqual(len(closed), 1, f"the episode the crash ended left no closing line: {lines}")
 
     def test_child_behind_that_reads_in_gulps_congests_once(self):
         """Fresh pass on 925d275c, F1: "the queue drained to low water" was
@@ -481,23 +565,46 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         on the reader: 9 episodes in 30 s, reader duty 0.31 vs 0.02 on
         6adfa33b, "caught up" logged nine times about a child that never did.
         Caught up means NOTHING is backed up: the queue is empty AND the kernel
-        pipe has room. A child behind at a steady rate congests once."""
+        pipe has room. A child behind at a steady rate congests once. (1000-B
+        frames, 600 f/s — the shape that was green on b18aae01 by coincidence.)"""
+        self._assert_gulp_child_congests_once(1000, 600.0)
+
+    def test_child_behind_that_reads_in_gulps_congests_once_at_the_rns_mtu(self):
+        """Fresh pass on b18aae01, F1: "queue empty AND pipe writable" is a
+        single sample, and at the RNS MTU it is true while the child is 1.3 s
+        behind — 502-B frames pack 32 to a 16 KB page, so the 256-frame queue
+        dump fills 8 of the pipe's 16 pages and select() reads writable. The
+        episode closed, the span re-armed, and the reader paid it again every
+        ~1.3 s (drill: 14 episodes / 368 waits / duty 0.38 in 20 s vs 6adfa33b
+        16 waits). The 1000-B twin above passed because 16 frames fill a page
+        exactly. Caught up must PERSIST, as the entry evidence must."""
+        self._assert_gulp_child_congests_once(500, 1200.0)
+
+    def _assert_gulp_child_congests_once(self, size, rate_fs):
         self._swap_iface({"name": "gulp", "command": self.cfg["command"] + " gulp 200000"})
         entered = self._spy_congestion()
         waits = 0; busy = 0.0
         t_end = time.monotonic() + 6.0; k = 0; t0 = time.monotonic()
         while time.monotonic() < t_end:
             k += 1
-            t = time.monotonic(); self.iface.process_outgoing(b"g" * 1000); dt = time.monotonic() - t
+            t = time.monotonic(); self.iface.process_outgoing(b"g" * size); dt = time.monotonic() - t
             busy += dt
             if dt >= 0.015: waits += 1
-            rem = t0 + k / 600.0 - time.monotonic()
+            rem = t0 + k / rate_fs - time.monotonic()
             if rem > 0: time.sleep(rem)
         self.assertGreater(self.iface.tx_dropped, 0, "the child was never behind; the shape is vacuous")
         self.assertNotEqual(entered, [], "a child that was behind never entered congested mode")
-        self.assertEqual(len(entered), 1, f"congested {len(entered)}x in 6 s: the gate re-armed on a child that never caught up ({waits} waits, {busy:.2f}s on the caller)")
-        allowed = int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
-        self.assertLessEqual(waits, allowed, f"{waits} calls waited for a slot ({busy:.2f}s of 6s on the caller; the gate allows {allowed} once)")
+        self.assertEqual(len(entered), 1, f"{size}-B frames: congested {len(entered)}x in 6 s: the gate re-armed on a child that never caught up ({waits} waits, {busy:.2f}s on the caller)")
+        # Up to TWO spans of waits, once: a gulp that lands inside the first
+        # span empties the pipe, the next sample reads writable and the span
+        # restarts — correctly, the child was not behind at that instant. The
+        # partial span is lost (measured at 500 B: waits 1.06-1.24 s, gulp,
+        # span restarts 1.49 s, entry 2.01 s = 36 waits with or without the
+        # waited-put sampling). A re-arming gate costs a span per gulp cycle
+        # (b18aae01: 91-104 waits in 6 s), far above this bound, and
+        # `entered == 1` above is what pins the re-arm.
+        allowed = 2 * int(getattr(PI.PipeInterface, "TX_CONGEST_FULL_S", 0.0) / PI.PipeInterface.TX_PUT_WAIT_S) + 6
+        self.assertLessEqual(waits, allowed, f"{size}-B frames: {waits} calls waited for a slot ({busy:.2f}s of 6s on the caller; the gate allows {allowed} once)")
 
     def test_span_start_cleared_by_the_writer_mid_sample_does_not_raise(self):
         """Fresh pass on 925d275c, F2: `_note_pipe_full` read the span start
