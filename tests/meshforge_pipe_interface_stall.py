@@ -17,9 +17,12 @@
 # shape tested at one size pins that size, not the rule.
 import fcntl
 import os
+import select
 import signal
+import struct
 import sys
 import tempfile
+import termios
 import textwrap
 import threading
 import time
@@ -204,10 +207,28 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         writers = [t for t in threading.enumerate() if t.name.startswith("pipe-writer-")]
         self.assertEqual(len(writers), 1, f"writer threads alive: {[t.name for t in writers]}")
 
+    def _pipe_buffered(self):
+        """Bytes sitting in the child's stdin pipe, from the write end."""
+        return struct.unpack("i", fcntl.ioctl(self.iface.process.stdin.fileno(), termios.FIONREAD, b"\0\0\0\0"))[0]
+
+    def _wait_child_reading(self):
+        """One frame, then wait until the child has READ it (pipe empty). A
+        just-spawned Python child takes 30-100 ms to reach its first read on a
+        Pi 4; a burst offered before that fills pipe + queue and the first
+        frame past them waits TX_PUT_WAIT_S for a child that is not reading
+        yet, and is dropped — frame 321 = 64 + 256 + 1 on a 64 KB pipe, every
+        run (4 KB-page canary, 2026-10-12). That measures startup, not the
+        gate; the tests about a HEALTHY child start from a child that reads."""
+        self.iface.process_outgoing(b"r" * 1000)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (self.iface.txb == 0 or self._pipe_buffered() > 0): time.sleep(0.002)
+        self.assertEqual(self._pipe_buffered(), 0, "the child never read the first frame")
+
     def test_healthy_child_burst_drops_nothing(self):
         """Fresh pass F2: a tight burst of frames a draining child would have
         taken (stock: 0 drops, the kernel pipe absorbs it) must not be dropped
         because the queue filled faster than the writer got the GIL."""
+        self._wait_child_reading()
         done, worst = self._send_many(2000, size=1000, budget_s=20.0)
         self.assertTrue(done)
         self.assertLess(worst, 1.0, f"a single process_outgoing took {worst:.2f}s")
@@ -716,6 +737,122 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertFalse(self.iface._tx_congested, "the span that began at 1.1 S is only 0.4 S old")
         self.iface._note_pipe_full(t0 + 2.2 * S)
         self.assertTrue(self.iface._tx_congested, "a span 1.1 S old did not congest (the shape is vacuous)")
+
+    def test_pipe_full_reads_occupancy_not_a_free_page(self):
+        """4 KB-page canary (2026-10-12, moc4 + moc5): `select()` says a pipe
+        is writable whenever ONE page is free, and on a 4 KB-page kernel a
+        child behind at 800 kB/s frees a page every ~5 ms, so 75 % of the
+        samples on a pipe that was 69-100 % full read writable, no span ever
+        formed, and the caller waited 4.3-4.6 s of every 5 s (the mf.6
+        saturation mf.7 claims to cure). Seven of the fleet's nine RNS boxes
+        are 4 KB pages; the arc was built and reviewed on the two 16 KB Pi 5s.
+        The kernel fact that does not depend on page size is how many BYTES
+        are buffered (FIONREAD, readable from the write end on both kernels):
+        a pipe three quarters full is backed up, whatever select() says."""
+        os.kill(self.child_pid, signal.SIGSTOP)
+        fd = self.iface.process.stdin.fileno()
+        cap = fcntl.fcntl(fd, 1032)   # F_GETPIPE_SZ
+        os.set_blocking(fd, False)
+        try:
+            written = 0
+            while written < cap * 3 // 4:
+                written += os.write(fd, b"\0" * min(4096, cap * 3 // 4 - written))
+        finally:
+            os.set_blocking(fd, True)
+        self.assertGreaterEqual(self._pipe_buffered(), cap * 3 // 4)
+        self.assertTrue(bool(select.select([], [fd], [], 0)[1]), "a quarter-empty pipe must still be writable: the shape is vacuous")
+        self.assertTrue(self.iface._pipe_full(), f"a pipe {self._pipe_buffered()} of {cap} bytes full read as not full")
+
+    def test_room_samples_clustered_in_time_do_not_abandon_the_span(self):
+        """4 KB-page canary (2026-10-12): a child that is behind and reads in
+        gulps empties the 64 KB pipe every ~0.3 s; the writer refills it in a
+        few ms. The caller samples the pipe only on puts that waited, and the
+        puts that waited through the full phase are all released in those few
+        ms — so 20-50 samples read ROOM inside one gulp cycle against 5 that
+        read full (one per 20 ms timeout), and a rule that abandons the span
+        on any room sample never let it reach TX_CONGEST_FULL_S (moc4: 68-81
+        waits vs 56 at 1000 B; the 500-B leg flaked). Evidence is weighed by
+        the TIME it stood for, not by how many samples landed in it: 0.3 S of
+        full samples one 0.1 S apart, then — one put-timeout (0.02 S) later —
+        30 room samples inside 0.01 S, then full samples again. The cluster
+        stood for ~0.03 S of room against 0.3 S of full, so the span survives;
+        full time reaches S at 1.1 S (0.3 + 0.17 + 0.6), not at 0.9 S."""
+        S = PI.PipeInterface.TX_CONGEST_FULL_S
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        t0 = time.monotonic()
+        for f in (0.0, 0.1, 0.2, 0.3): self.iface._note_pipe_full(t0 + f * S)
+        full[0] = False
+        for i in range(30): self.iface._note_pipe_full(t0 + 0.32 * S + i * 0.0003 * S)
+        self.assertIsNotNone(self.iface._tx_full_since, "30 room samples spanning 0.01 S abandoned a 0.3 S span of full ones")
+        full[0] = True
+        for f in (0.5, 0.7, 0.9): self.iface._note_pipe_full(t0 + f * S)
+        self.assertFalse(self.iface._tx_congested, "congested before TX_CONGEST_FULL_S of full evidence (0.87 S)")
+        self.iface._note_pipe_full(t0 + 1.1 * S)
+        self.assertTrue(self.iface._tx_congested, "a child behind for 1.1 S with one 10 ms cluster of room samples did not congest")
+
+    def test_room_that_outweighs_full_in_time_abandons_the_span(self):
+        """The other side of the time-weighted rule: a healthy child under GIL
+        hogs leaves the pipe with room for most of the time the caller is
+        waiting (the writer, not the child, is behind). When the time the
+        pipe had room exceeds the time it was backed up, the span is over —
+        however long it has been open. 0.5 S of full samples, 0.6 S of room
+        (abandons at 1.1 S: 0.6 > 0.5), then 0.5 S of full: a gate that never
+        abandons on room has 1.0 S of full time here and congests; the span
+        must have started fresh at 1.2 S and hold 0.5 S. The same fresh span
+        congests at 2.3 S (1.1 S), so the shape is not vacuous."""
+        S = PI.PipeInterface.TX_CONGEST_FULL_S
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        t0 = time.monotonic()
+        for f in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5): self.iface._note_pipe_full(t0 + f * S)
+        full[0] = False
+        for f in (0.7, 0.9, 1.1): self.iface._note_pipe_full(t0 + f * S)
+        self.assertIsNone(self.iface._tx_full_since, "0.6 S of room against 0.5 S of full did not abandon the span")
+        full[0] = True
+        for f in (1.2, 1.4, 1.6, 1.7): self.iface._note_pipe_full(t0 + f * S)
+        self.assertFalse(self.iface._tx_congested, "congested with 0.5 S of full evidence in the fresh span: the abandoned span's full time was carried")
+        for f in (2.0, 2.3): self.iface._note_pipe_full(t0 + f * S)
+        self.assertTrue(self.iface._tx_congested, "a fresh 1.1 S span after the abandoned one did not congest (the shape is vacuous)")
+
+    def test_caught_up_needs_an_empty_queue_and_a_pipe_with_room(self):
+        """Both halves of `_child_caught_up`, pinned without a kernel: the
+        gulp-at-600-f/s shape above tells "queue empty" from "queue under low
+        water" only on 16 KB pages (on a 64 KB pipe the queue dump does not
+        fit, so the `lowwater` mutant survived the whole file on moc4). With
+        the pipe backed up an empty queue is NOT caught up; with room it is;
+        with room and one frame still queued it is not."""
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        self.assertEqual(self.iface._txq.qsize(), 0)
+        self.assertFalse(self.iface._child_caught_up(), "an empty queue in front of a backed-up pipe read as caught up")
+        full[0] = False
+        self.assertTrue(self.iface._child_caught_up())
+        # park the writer so the frame stays queued for the sample
+        self.iface._writer_gen += 1
+        self.iface._writer.join(2)
+        self.iface._txq.put_nowait(b"q")
+        self.assertFalse(self.iface._child_caught_up(), "a queued frame in front of a pipe with room read as caught up")
+
+    def test_a_put_that_found_the_queue_full_samples_however_short_its_wait(self):
+        """4 KB-page canary (2026-10-12): a child behind at 800 kB/s on a 4 KB
+        kernel frees 8 slots every ~5 ms, so a put that found the queue full
+        gets its slot in under TX_PUT_WAIT_S / 2 and a wait-length rule never
+        sampled the pipe. The queue being full on arrival IS the caller being
+        throttled; the sample must happen whatever the wait turned out to be.
+        Pinned with a queue that reports full and hands out the slot at once
+        (on the real kernel the 800 kB/s shape also samples on jitter waits,
+        so the `nothrottled` mutant survived the file on both kernels)."""
+        noted = []
+        self.iface._note_pipe_full = lambda now: noted.append(now)
+        class InstantFullQueue:
+            def full(self): return True
+            def put(self, data, timeout=None): return None
+            def put_nowait(self, data): return None
+            def qsize(self): return PI.PipeInterface.TX_QUEUE_DEPTH
+        self.iface._txq = InstantFullQueue()
+        self.iface.process_outgoing(b"t" * 500)
+        self.assertEqual(len(noted), 1, "a put that found the queue full and waited ~0 ms did not sample the pipe")
 
     def test_interface_stats_carry_dropped_and_congested(self):
         """Same finding, the rnstatus half: `get_interface_stats` must expose

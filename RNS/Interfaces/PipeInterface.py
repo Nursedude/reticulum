@@ -39,6 +39,9 @@ import subprocess
 import shlex
 import queue
 import select
+import fcntl
+import struct
+import termios
 
 class HDLC():
     # The Pipe Interface packetizes data using
@@ -131,6 +134,35 @@ class PipeInterface(Interface):
     # water" was not that, see _child_caught_up), or when no put has waited
     # or timed out for TX_CONGEST_FULL_S (the caller was being served).
     TX_CONGEST_FULL_S = 0.5
+    # 1.3.8+mf.8 (2026-10-12): everything above was built and reviewed on the
+    # two Pi 5s (16 KB pages, 256 KB pipe). Seven of the fleet's nine RNS
+    # boxes are Pi 3/4: 4 KB pages, a 64 KB pipe, and the mf.7 tag's own tests
+    # failed there (moc4 py3.11 + moc5 py3.13, 5/23 then 4/23 then 4/23), run
+    # from a clone on the canary BEFORE any install. Two page-size couplings:
+    # (1) "pipe full" was select(): writable the moment ONE page is free. On
+    #     4 KB pages a child behind at 800 kB/s frees a page every ~5 ms, so
+    #     75 % of the samples on a pipe 69-100 % full read writable, no span
+    #     formed, and the caller waited 4.3-4.6 s of every 5 s — the mf.6
+    #     saturation. The kernel fact that does not depend on the page size is
+    #     how many BYTES are buffered (FIONREAD on the write end): the pipe is
+    #     backed up when it holds at least TX_PIPE_FULL_FRACTION of its
+    #     capacity (F_GETPIPE_SZ). 100 % of the same samples read >= 50 %.
+    # (2) the span was abandoned on ANY room sample. A gulp child empties a
+    #     64 KB pipe every ~0.3 s and the writer refills it in a few ms; the
+    #     puts that waited through the full phase are released in those ms,
+    #     so 20-50 room samples land in one 10 ms window against 5 full ones,
+    #     and the span never reached TX_CONGEST_FULL_S (68-81 waits vs 56).
+    #     Evidence now weighs the TIME it stood for: each sample adds the gap
+    #     since the previous one to full or room time; the span congests when
+    #     full time reaches TX_CONGEST_FULL_S and is abandoned when room time
+    #     exceeds full time (a healthy child under GIL hogs: the pipe has room
+    #     for most of the time the caller waits), on a quiet gap, or by the
+    #     writer on a caught-up child, as before.
+    # A third 4 KB finding was the TEST: a 2000-frame burst into a child that
+    # has not reached its first read yet drops frame 321 = 64 + 256 + 1 after
+    # TX_PUT_WAIT_S, deterministically; startup latency, not the gate.
+    TX_PIPE_FULL_FRACTION = 0.5
+    F_GETPIPE_SZ = getattr(fcntl, "F_GETPIPE_SZ", 1032)
 
     owner    = None
     command  = None
@@ -168,8 +200,11 @@ class PipeInterface(Interface):
         self._tx_congested = False
         self._tx_full_since = None
         self._tx_full_last = 0.0
+        self._tx_full_time = 0.0
+        self._tx_room_time = 0.0
         self._tx_clear_since = None
         self._tx_episode_dropped = 0
+        self._pipe_cap = None
         self._writer_gen = 0
         self._writer = None
 
@@ -219,6 +254,7 @@ class PipeInterface(Interface):
         self._tx_congested = False
         self._tx_full_since = None
         self._tx_clear_since = None
+        self._pipe_cap = None   # a new child, a new pipe: re-read its capacity
         self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
                                         name=f"pipe-writer-{self.name}")
         self._writer.start()
@@ -242,12 +278,18 @@ class PipeInterface(Interface):
             try:
                 if self._tx_congested: self._txq.put_nowait(data)
                 else:
+                    # A put that found the queue full on arrival waited for a
+                    # slot however briefly it got one: on 4 KB pages a child
+                    # behind at 800 kB/s frees 8 slots every ~5 ms, so the
+                    # wait is under TX_PUT_WAIT_S / 2 and a wait-length rule
+                    # alone never sampled (4 KB canary, 2026-10-12).
+                    throttled = self._txq.full()
                     t = time.monotonic()
                     self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
                     now = time.monotonic()
                     # Waited for the slot and got it: the same evidence as a
-                    # timed-out put if the pipe is full (see TX_CONGEST_FULL_S).
-                    if now - t >= PipeInterface.TX_PUT_WAIT_S / 2: self._note_pipe_full(now)
+                    # timed-out put if the pipe is backed up (see TX_CONGEST_FULL_S).
+                    if throttled or now - t >= PipeInterface.TX_PUT_WAIT_S / 2: self._note_pipe_full(now)
             except queue.Full:
                 # The queue is not empty: whatever caught-up run was open is over.
                 self._tx_clear_since = None
@@ -271,20 +313,39 @@ class PipeInterface(Interface):
         return self._tx_congested
 
     def _note_pipe_full(self, now):
-        # Called on a put that waited or timed out. One pipe-full sample is not evidence the
-        # child is behind (see TX_CONGEST_FULL_S); a span of them is.
-        if not self._pipe_full():
-            self._tx_full_since = None
-            return
-        # One read: the writer thread clears _tx_full_since without a lock,
-        # and a clear between a second read and the subtraction raised
+        # Called on a put that waited or timed out. One backed-up sample is
+        # not evidence the child is behind (see TX_CONGEST_FULL_S); a span of
+        # them is. Each sample stands for the time since the previous one,
+        # credited to whatever the kernel says NOW: samples cluster in the
+        # milliseconds the writer frees slots, so counting them would weigh
+        # the pipe's emptiest instants 10x (4 KB canary, 2026-10-12).
+        backed_up = self._pipe_full()
+        # One read each: the writer thread clears _tx_full_since without a
+        # lock, and a clear between a second read and the subtraction raised
         # TypeError on the TX path (fresh pass on 925d275c, F2).
         since = self._tx_full_since
-        if since is None or now - self._tx_full_last > PipeInterface.TX_CONGEST_FULL_S:
-            since = now
-        self._tx_full_since = since
+        last = self._tx_full_last
+        if since is None or now - last > PipeInterface.TX_CONGEST_FULL_S:
+            # No span open, or no put waited for a whole span (the caller was
+            # being served): a backed-up sample starts one, a room sample does not.
+            if not backed_up:
+                self._tx_full_since = None
+                return
+            self._tx_full_time = 0.0
+            self._tx_room_time = 0.0
+            self._tx_full_since = now
+            self._tx_full_last = now
+            return
+        gap = now - last if now > last else 0.0
+        if backed_up: self._tx_full_time += gap
+        else: self._tx_room_time += gap
         self._tx_full_last = now
-        full_for = now - since
+        if self._tx_room_time > self._tx_full_time:
+            # The pipe had room for longer than it was backed up: the writer,
+            # not the child, is what the caller has been waiting on.
+            self._tx_full_since = None
+            return
+        full_for = self._tx_full_time
         if full_for >= PipeInterface.TX_CONGEST_FULL_S and not self._tx_congested:
             self._tx_congested = True
             self._tx_clear_since = None
@@ -317,14 +378,32 @@ class PipeInterface(Interface):
         return self._txq.qsize() == 0 and not self._pipe_full()
 
     def _pipe_full(self):
-        # The kernel's own fact, one non-blocking syscall per put that waited
-        # (which already cost >= TX_PUT_WAIT_S / 2). Unobservable reads as NOT
-        # full: without evidence the interface keeps mf.6 back-pressure.
-        # Every error shape (process None, stdin None/closed, dead child,
-        # non-pipe fd) lands here (fresh pass on 6adfa33b, F5) — counted so
-        # a probe that is permanently broken is not permanently invisible.
+        # The kernel's own fact, one ioctl per put that waited: the bytes
+        # buffered in the child's stdin pipe (FIONREAD works from the write
+        # end on Linux), against the pipe's capacity (F_GETPIPE_SZ, read once
+        # per child). Backed up = at least TX_PIPE_FULL_FRACTION of it. Not a
+        # free-page poll: select() reads writable whenever ONE page is free,
+        # and how often that is depends on the page size (4 KB canary,
+        # 2026-10-12: 75 % writable on a pipe 69-100 % full). Where the
+        # capacity cannot be read (not Linux) the free-page poll is kept.
+        # Unobservable reads as NOT full: without evidence the interface keeps
+        # mf.6 back-pressure. Every error shape (process None, stdin
+        # None/closed, dead child, non-pipe fd) lands here (fresh pass on
+        # 6adfa33b, F5) — counted so a probe that is permanently broken is
+        # not permanently invisible.
         try:
-            return not select.select([], [self.process.stdin], [], 0)[1]
+            fd = self.process.stdin.fileno()
+            cap = self._pipe_cap
+            if cap is None:
+                try:
+                    cap = fcntl.fcntl(fd, PipeInterface.F_GETPIPE_SZ)
+                except OSError:
+                    cap = 0
+                self._pipe_cap = cap
+            if cap <= 0:
+                return not select.select([], [fd], [], 0)[1]
+            buffered = struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+            return buffered >= cap * PipeInterface.TX_PIPE_FULL_FRACTION
         except Exception as e:
             self.tx_probe_errors += 1
             if self.tx_probe_errors == 1:

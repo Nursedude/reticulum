@@ -102,6 +102,93 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### `1.3.8+mf.8` (UNRELEASED) — the PipeInterface congestion gate reads the pipe in bytes, not pages, and weighs its evidence by time, not by sample count
+
+Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2),
+where the `1.3.8+mf.7` tag's own stall file failed 5/23, 4/23, 4/23 from a
+clone before any install (operator: "go — mf.8 red-first on moc4"). Seven of
+the fleet's nine RNS boxes are Pi 3/4 with 4 KB pages and a 64 KB pipe; the
+whole mf.6/mf.7 arc — build and six non-author passes — ran on the two Pi 5s
+(16 KB pages, 256 KB pipe) and never saw the kernel class the gate ships to.
+Measured first (`drill_occ.py`, per put that waited: `select()` writability
+and `FIONREAD` occupancy, both kernels):
+
+| scenario (moc4, 4 KB) | select() writable | occupancy ≥ 50 % | mf.7 outcome |
+|---|---|---|---|
+| child behind at 800 kB/s, 1.2 MB/s offered | 75 % of samples | 100 % (median 0.84, min 0.69) | never congested; caller busy 3.5 s of 4 s |
+| gulp child 200 kB/s, 1000 B at 600 f/s | 66 % | 57 % by count — alternating 5/5 full and 24/52 room per 100 ms | never congested in 4 s |
+| healthy child, 2000-frame burst | 99 % | 9 % (median 0.00) | 1 frame dropped: frame 321 = 64 + 256 + 1, every run |
+
+Two page-size couplings in the gate, one in a test:
+
+1. **"Pipe full" was a free-page poll.** `select()` reads writable the moment
+   ONE page is free, and on 4 KB pages a child behind at 800 kB/s frees a
+   page every ~5 ms, so three samples in four read writable on a pipe that
+   was 69–100 % full, no span ever formed, and the forwarding caller paid
+   the mf.6 saturation (4.3–4.6 s of every 5 s). The kernel fact that does
+   not depend on the page size is how many BYTES are buffered: `FIONREAD`
+   on the write end (works on both kernels) against `F_GETPIPE_SZ`. The pipe
+   is backed up when it holds at least `TX_PIPE_FULL_FRACTION` (0.5) of its
+   capacity. Where the capacity cannot be read (not Linux) the free-page
+   poll is kept; an ioctl failure is counted (`tx_probe_errors`) and reads
+   NOT full, as before. A put that found the queue FULL on arrival now
+   samples regardless of how long it waited (on 4 KB pages that wait is
+   under `TX_PUT_WAIT_S / 2`, so the wait-length rule alone never sampled).
+2. **The span was abandoned on ANY room sample, and samples cluster in
+   time.** A gulp child empties a 64 KB pipe every ~0.3 s and the writer
+   refills it in a few ms; every put that waited through the full phase is
+   released in those ms, so 20–50 room samples land in one 10 ms window
+   against 5 full ones (one per 20 ms timeout), and the span never reached
+   `TX_CONGEST_FULL_S`. Each sample now stands for the time since the
+   previous one, credited to what the kernel says at that sample: the span
+   congests when full time reaches `TX_CONGEST_FULL_S`, and is abandoned
+   when room time exceeds full time (a healthy child under GIL hogs leaves
+   the pipe with room for most of the time the caller waits — the writer,
+   not the child, is behind), on a quiet gap of `TX_CONGEST_FULL_S` with no
+   waited put, or by the writer on a caught-up child, as before. Exit is
+   unchanged in form: queue empty AND pipe not backed up, persisting across
+   `TX_CONGEST_FULL_S` of offers.
+3. **The healthy-burst test measured child startup.** A just-spawned Python
+   child reaches its first read 30–100 ms after `Popen` on a Pi 4; a burst
+   offered before that fills pipe + queue and the first frame past them
+   (321 on a 64 KB pipe) waits `TX_PUT_WAIT_S` for a child that is not
+   reading yet and is dropped — deterministically, on mf.6 too. With the
+   child confirmed reading first: 0 of 2000 dropped, 3/3. The tests about a
+   HEALTHY child now start from a child that reads (`_wait_child_reading`).
+   The production shape is real and small: frames offered past the buffers
+   in a child's first ~100 ms are dropped after 20 ms, and counted.
+
+Tests: `test_pipe_full_reads_occupancy_not_a_free_page` (child stopped, pipe
+filled to 75 % by hand: `select()` writable, `_pipe_full()` must be True —
+red on mf.7 on both kernels) and
+`test_room_samples_clustered_in_time_do_not_abandon_the_span` (explicit
+clocks: 0.3 S of full samples, 30 room samples inside 0.01 S one timeout
+later, full again — survives, congests at 1.1 S; red on mf.7 on both
+kernels) are the red-first pair; `test_room_that_outweighs_full_in_time_
+abandons_the_span` pins the other side (0.5 S full, 0.6 S room abandons,
+0.5 S full in the fresh span must NOT congest — a gate that never abandons
+on room has 1.0 S of full time there and does; the fresh span congests at
+1.1 S, so the shape is not vacuous). Stall file on this cut (before the two extra pins): moc4
+(4 KB, py3.11) `Ran 26 OK` rc=0, VolcanoAI (16 KB, py3.13) `Ran 26 OK` rc=0;
+`meshforge_*` 63 OK, `tests.all` 36 OK (1 skipped). Two more deterministic
+pins came out of the matrix: `test_caught_up_needs_an_empty_queue_and_a_
+pipe_with_room` (the `lowwater` leg survived the whole file on moc4 — on a
+64 KB pipe the queue dump does not fit, so the gulp shape pins nothing
+there) and `test_a_put_that_found_the_queue_full_samples_however_short_its_
+wait` (the `throttled` leg survived on both kernels: at 800 kB/s jitter
+waits sample anyway). Final stall file `Ran 28 OK` rc=0 on both kernels.
+Mutant matrix (`tests/meshforge_pipe_tools/mutants8.sh`, pattern-anchored:
+span0, never, always, selectpoll = the mf.7 free-page poll, nogap, noreset,
+lowwater, countweighted, noroom, anyroom = the mf.7 abandon rule,
+nothrottled) run on BOTH kernels: **all 11 killed on both** (selectpoll by
+1 test on 16 KB — the deterministic occupancy test — and 3 on 4 KB; anyroom
+by 1 on 16 KB and 3 on 4 KB; the rest identical). Tools kept in
+`tests/meshforge_pipe_tools/` (drills + matrix + README). Not changed: `TX_PUT_WAIT_S`, `TX_CONGEST_FULL_S`,
+`TX_QUEUE_DEPTH`, `TX_STALL_S`, the writer thread, framing, respawn.
+Non-author pass owed before any tag; this session wrote the code and never
+tags. **For every future PipeInterface pass: `getconf PAGESIZE` across the
+fleet first, and the stall file on a 4 KB box BEFORE the verdict.**
+
 ### `1.3.8+mf.7` (2026-10-12) — a PipeInterface child that is behind costs a forwarding reader one wait per congestion episode, and stops flapping
 
 Transport-forwarding drill 2026-10-10 (three private instances: TCP client →
