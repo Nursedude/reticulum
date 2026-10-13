@@ -59,7 +59,8 @@ is kept at arm's length on purpose:
   ours or anyone's. (MeshForge's `evals/local_brain/` cases are triage
   prompts, not RNS source; keep it that way.)
 - Every account whose AI sessions read or patch this fork has model training
-  on its data turned OFF. Date confirmed: _(operator to fill in)_.
+  on its data turned OFF. Confirmed off by the operator 2026-10-13. MeshForge
+  is, and has always been, a non-commercial project.
 - MeshForge and MeshAnchor (GPL-3.0) combine with this fork under a GPL §7
   additional permission — see their `LICENSE-EXCEPTION.md`.
 
