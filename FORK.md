@@ -52,6 +52,17 @@ creation) does not implicate those restrictions. The upstream copyright and
 permission notice are preserved. MeshForge modifications are recorded in
 `NOTICE`.
 
+**AI-training clause — standing rules (2026-10-13).** This fork is developed
+with AI assistants, so the "directly or indirectly … training dataset" clause
+is kept at arm's length on purpose:
+- No RNS/LXMF source goes into a dataset, an eval fixture, or a fine-tune —
+  ours or anyone's. (MeshForge's `evals/local_brain/` cases are triage
+  prompts, not RNS source; keep it that way.)
+- Every account whose AI sessions read or patch this fork has model training
+  on its data turned OFF. Date confirmed: _(operator to fill in)_.
+- MeshForge and MeshAnchor (GPL-3.0) combine with this fork under a GPL §7
+  additional permission — see their `LICENSE-EXCEPTION.md`.
+
 ## Tracking upstream
 
 Stock RNS may publish future releases off-GitHub. To incorporate one:
