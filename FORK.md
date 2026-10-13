@@ -377,6 +377,83 @@ the poll back-off alternative was reasoned, not built. **Owed:** a FRESH
 non-author pass on a 4 KB box before any tag — `accept.sh` is its first step,
 then the shapes this author did not think of.
 
+#### 2026-10-12 — Acceptance legs added after the fresh pass (arc paused)
+
+The fresh non-author pass on `8acd4d18` read NOT TAG-READY. No gate code
+changed here (`RNS/` untouched, no version bump, no tag); `accept.sh` gained
+three legs that move AXES — burner count B, idle duration, frame SIZE — so the
+next resume starts from a red that already exists. Drills copied from the
+reviewer with a source header: `drill_gil.py` (← `gilsticky.py`),
+`drill_smallgulp.py` (← `smallgulp.py`). Select with `LEGS="9 10 11"`.
+
+- **F1 (CPU contention):** with two pure-Python spin threads the writer's idle
+  poll gap stretches from 20 ms to hundreds of ms, the exit's credited
+  coverage is never met, and the burst after SIGCONT meets a stale flag (leg 9).
+- **F2 (idle then burst, since mf.6):** `_tx_last_drain` is the last COMPLETED
+  write, so after `TX_STALL_S` + 1 s of nothing to write, the first put that
+  waits reads as a 5 s stall about a healthy child (leg 10; asserts no `has
+  not drained its stdin` line and `online` never False).
+- **F3 (frame size, 4 KB pages):** a full queue of 30 B frames fits under the
+  32 KB line, so each gulp reads as caught up and the episode flaps about a
+  child still behind (leg 11).
+
+**Load rule:** the load a B=2 run applied is the writer's idle-poll gap median
+when ≥ 5 polls were seen, else `drill_gil.py`'s witness (the main thread
+waiting `queue.get(timeout=TX_PUT_WAIT_S)` through the quiet). A HEALTHY B=2
+run under 100 ms is UNKNOWN, never GREEN; a DEFECTIVE one stays RED; an
+episode that never entered is UNKNOWN. **A leg green everywhere measured
+nothing.**
+
+Red first, moc4 (Pi 4, PAGESIZE 4096, F_GETPIPE_SZ 65536, py 3.11.2, nproc 4),
+fresh clones, shim `configobj`, each run started at loadavg < 1.0; rnsd
+`MainPID=899829 NRestarts=0` before and after. Verdict lines verbatim:
+
+```
+$ LEGS="9 10 11" accept.sh ~/mf11-accept/t10 out/t10   # rc=1
+WHERE: tree=/home/wh6gxz/mf11-accept/t10 head=8acd4d18 gate_md5=c896454bb88b pagesize=4096 pipe_sz=65536 python=3.11.2 nproc=4 host=wh6gxzmesh legs=9,10,11 loadavg_at_start=0.41 0.74 0.66
+9 sticky under CPU contention B=2 x3 + B=0 + no-episode B=2  RED      gil9_ep_b2_1:R,B=2,load=244ms(poll),wake=31,poll=244,provoked=True,cbb=True,burst_drops=1737,stall_lines=0,offline=0; gil9_ep_b2_2:UNKNOWN(episode not provoked, load=31ms(wake),wake=31,poll=-1); gil9_ep_b2_3:R,B=2,load=71ms(poll),wake=92,poll=71,provoked=True,cbb=True,burst_drops=1707,stall_lines=0,offline=0; gil9_ep_b0:G,B=0,load=20ms(poll),wake=20,poll=20,provoked=True,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil9_ctl_b2:U,B=2,load=45ms(wake),wake=45,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0
+10 idle TX_STALL_S+1 then burst B=2 x5 + B=0 x3 + 3s B=2 x3  RED      gil10_idle_b2_1:G,B=2,load=229ms(wake),wake=229,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b2_2:G,B=2,load=209ms(wake),wake=209,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0; gil10_idle_b2_3:U,B=2,load=41ms(wake),wake=41,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0; gil10_idle_b2_4:R,B=2,load=960ms(wake),wake=960,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=1,offline=1; gil10_idle_b2_5:U,B=2,load=76ms(wake),wake=76,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_1:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_2:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_3:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_q3_b2_1:G,B=2,load=120ms(wake),wake=120,poll=-1,provoked=False,cbb=False,burst_drops=3,stall_lines=0,offline=0; gil10_q3_b2_2:G,B=2,load=350ms(wake),wake=350,poll=-1,provoked=False,cbb=False,burst_drops=2,stall_lines=0,offline=0; gil10_q3_b2_3:U,B=2,load=42ms(wake),wake=42,poll=-1,provoked=False,cbb=False,burst_drops=3,stall_lines=0,offline=0
+11 gulp SIZE=30 x2 + rate ctl + SIZE=500                     RED      sg11_30_1:SIZE=30,CM=gulp,entries=8,exits=7,duty=0.234,congested_end=True; sg11_30_2:SIZE=30,CM=gulp,entries=10,exits=9,duty=0.229,congested_end=True; sg11_30_rate:SIZE=30,CM=rate,entries=1,exits=0,duty=0.085,congested_end=True; sg11_500:SIZE=500,CM=gulp,entries=1,exits=0,duty=0.031,congested_end=True
+VERDICT: 0 GREEN, 3 RED, 0 UNKNOWN of 3
+
+$ LEGS="9 10 11" accept.sh ~/mf11-accept/t9 out/t9   # rc=1
+WHERE: tree=/home/wh6gxz/mf11-accept/t9 head=c3c52232 gate_md5=2c25c69ed3c9 pagesize=4096 pipe_sz=65536 python=3.11.2 nproc=4 host=wh6gxzmesh legs=9,10,11 loadavg_at_start=0.36 0.64 0.66
+9 sticky under CPU contention B=2 x3 + B=0 + no-episode B=2  RED      gil9_ep_b2_1:UNKNOWN(episode not provoked, load=58ms(wake),wake=58,poll=-1); gil9_ep_b2_2:R,B=2,load=35ms(wake),wake=35,poll=-1,provoked=True,cbb=True,burst_drops=1743,stall_lines=0,offline=0; gil9_ep_b2_3:R,B=2,load=56ms(wake),wake=56,poll=-1,provoked=True,cbb=True,burst_drops=1740,stall_lines=0,offline=0; gil9_ep_b0:R,B=0,load=20ms(wake),wake=20,poll=-1,provoked=True,cbb=True,burst_drops=1738,stall_lines=0,offline=0; gil9_ctl_b2:U,B=2,load=32ms(wake),wake=32,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0
+10 idle TX_STALL_S+1 then burst B=2 x5 + B=0 x3 + 3s B=2 x3  RED      gil10_idle_b2_1:U,B=2,load=86ms(wake),wake=86,poll=-1,provoked=False,cbb=False,burst_drops=8,stall_lines=0,offline=0; gil10_idle_b2_2:U,B=2,load=43ms(wake),wake=43,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0; gil10_idle_b2_3:U,B=2,load=44ms(wake),wake=44,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0; gil10_idle_b2_4:G,B=2,load=889ms(wake),wake=889,poll=-1,provoked=False,cbb=False,burst_drops=1,stall_lines=0,offline=0; gil10_idle_b2_5:R,B=2,load=966ms(wake),wake=966,poll=-1,provoked=False,cbb=False,burst_drops=1744,stall_lines=1,offline=1; gil10_idle_b0_1:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_2:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_3:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_q3_b2_1:G,B=2,load=279ms(wake),wake=279,poll=-1,provoked=False,cbb=False,burst_drops=5,stall_lines=0,offline=0; gil10_q3_b2_2:G,B=2,load=300ms(wake),wake=300,poll=-1,provoked=False,cbb=False,burst_drops=2,stall_lines=0,offline=0; gil10_q3_b2_3:G,B=2,load=488ms(wake),wake=488,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0
+11 gulp SIZE=30 x2 + rate ctl + SIZE=500                     RED      sg11_30_1:SIZE=30,CM=gulp,entries=8,exits=7,duty=0.231,congested_end=True; sg11_30_2:SIZE=30,CM=gulp,entries=10,exits=9,duty=0.236,congested_end=True; sg11_30_rate:SIZE=30,CM=rate,entries=1,exits=0,duty=0.076,congested_end=True; sg11_500:SIZE=500,CM=gulp,entries=1,exits=0,duty=0.030,congested_end=True
+VERDICT: 0 GREEN, 3 RED, 0 UNKNOWN of 3
+
+$ LEGS="9 10 11" accept.sh ~/mf11-accept/t8 out/t8   # rc=2
+WHERE: tree=/home/wh6gxz/mf11-accept/t8 head=9120f760 gate_md5=78207447b72f pagesize=4096 pipe_sz=65536 python=3.11.2 nproc=4 host=wh6gxzmesh legs=9,10,11 loadavg_at_start=0.44 0.66 0.68
+9 sticky under CPU contention B=2 x3 + B=0 + no-episode B=2  UNKNOWN  gil9_ep_b2_1:U,B=2,load=31ms(wake),wake=31,poll=-1,provoked=True,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil9_ep_b2_2:U,B=2,load=74ms(wake),wake=74,poll=-1,provoked=True,cbb=False,burst_drops=11,stall_lines=0,offline=0; gil9_ep_b2_3:UNKNOWN(episode not provoked, load=31ms(wake),wake=31,poll=-1); gil9_ep_b0:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=True,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil9_ctl_b2:U,B=2,load=57ms(wake),wake=57,poll=-1,provoked=False,cbb=False,burst_drops=4,stall_lines=0,offline=0
+10 idle TX_STALL_S+1 then burst B=2 x5 + B=0 x3 + 3s B=2 x3  RED      gil10_idle_b2_1:U,B=2,load=43ms(wake),wake=43,poll=-1,provoked=False,cbb=False,burst_drops=14,stall_lines=0,offline=0; gil10_idle_b2_2:R,B=2,load=350ms(wake),wake=350,poll=-1,provoked=False,cbb=False,burst_drops=1744,stall_lines=1,offline=1; gil10_idle_b2_3:R,B=2,load=277ms(wake),wake=277,poll=-1,provoked=False,cbb=False,burst_drops=1744,stall_lines=1,offline=1; gil10_idle_b2_4:G,B=2,load=325ms(wake),wake=325,poll=-1,provoked=False,cbb=False,burst_drops=2,stall_lines=0,offline=0; gil10_idle_b2_5:R,B=2,load=32ms(wake),wake=32,poll=-1,provoked=False,cbb=False,burst_drops=1744,stall_lines=1,offline=1; gil10_idle_b0_1:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_2:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_idle_b0_3:G,B=0,load=20ms(wake),wake=20,poll=-1,provoked=False,cbb=False,burst_drops=0,stall_lines=0,offline=0; gil10_q3_b2_1:U,B=2,load=31ms(wake),wake=31,poll=-1,provoked=False,cbb=False,burst_drops=7,stall_lines=0,offline=0; gil10_q3_b2_2:G,B=2,load=737ms(wake),wake=737,poll=-1,provoked=False,cbb=False,burst_drops=8,stall_lines=0,offline=0; gil10_q3_b2_3:U,B=2,load=38ms(wake),wake=38,poll=-1,provoked=False,cbb=False,burst_drops=4,stall_lines=0,offline=0
+11 gulp SIZE=30 x2 + rate ctl + SIZE=500                     RED      sg11_30_1:SIZE=30,CM=gulp,entries=6,exits=5,duty=0.178,congested_end=True; sg11_30_2:SIZE=30,CM=gulp,entries=5,exits=4,duty=0.139,congested_end=True; sg11_30_rate:SIZE=30,CM=rate,entries=1,exits=0,duty=0.061,congested_end=True; sg11_500:SIZE=500,CM=gulp,entries=1,exits=0,duty=0.030,congested_end=True
+VERDICT: 0 GREEN, 2 RED, 1 UNKNOWN of 3
+```
+
+Expected vs read: leg 10 RED ×3 and leg 11 RED ×3 as claimed; leg 9 RED on
+`8acd4d18` as claimed. **Did not read as claimed:**
+(a) leg 9 on `9120f760` reads **UNKNOWN, not GREEN** — its healthy B=2 runs
+show a witness of 31–74 ms, so the rule refuses the green. The witness
+under-reads the writer: on `8acd4d18` run 1 the writer's poll gap was 244 ms
+while the main thread's was 31 ms (across calibration and these runs: 0.1–1.25×). Trees without
+`_writer_observes` have no writer-side witness; a gate seam (a writer-wake
+timestamp) would be needed to measure contention where it bites — not added.
+(b) leg 9 on `c3c52232`: its B=0 control is RED too (1,738 drops, flag held)
+— the mf.9 sticky exit (0.7 s offer gap > 0.5 s window) fires without any
+contention, so leg 9 cannot separate F1 from mf.9's own defect on that tree.
+(c) with burners started BEFORE the provoke (the acceptance shape),
+`8acd4d18` often does not enter within the reviewer's 1.5 s SIGSTOP budget
+(3 of 4 calibration runs; 9120f760 4 of 4 entered) — the entry credit is
+starved like the exit's. Leg 9 uses `PROVOKE_S=4`; 1 of 3 runs per tree still
+did not enter (UNKNOWN). Entry latency under contention is unmeasured as a leg.
+(d) F2 is intermittent: stall lines in 1/5 (`8acd4d18`), 1/5 (`c3c52232`),
+3/5 (`9120f760`) B=2 runs, 0/9 at B=0, 0/9 at 3 s idle B=2.
+Also fixed in `accept.sh`: a relative `<outdir>` broke every run (the runs
+`cd` into the tree); OUT is now made absolute. Logs:
+`~/.local/share/meshforge/mf7-review-tools/mf11-accept/` on the MeshForge
+manager box.
+
 ### `1.3.8+mf.9` (UNRELEASED) — the congestion gate credits only time it OBSERVED, and closes an episode on what the domain loses
 
 Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2,

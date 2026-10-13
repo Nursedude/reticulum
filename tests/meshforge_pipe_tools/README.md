@@ -38,6 +38,37 @@ No RNS instance is started; the fixture is `tests/meshforge_pipe_interface_stall
   change AFTER it. Legs: pulse x5 (+ behind control), tick 160k (+ 100k),
   sticky 0.7 s x3 (+ 0.3 s, no episode), quiet-then-burst x3 (+ no episode),
   slowgulp, hung (SIGSTOP), healthy burst, behind (`rate 100000`). ~4 min.
+  `<outdir>` may be relative (made absolute before the runs `cd` into the tree;
+  a relative one broke every run before 2026-10-12).
+  Legs 9-11 (2026-10-12, after the fresh pass on 8acd4d18, arc paused) move
+  three AXES instead of adding shapes: burner count B (pure-Python spin
+  threads, 0 or 2, started before the provoke and kept through the burst),
+  idle duration (3 s and `TX_STALL_S + 1`, read from the class), and frame
+  SIZE for the gulp leg (30 B and 500 B). 9 = sticky under B=2 (+ B=0, +
+  no-episode B=2); 10 = idle `TX_STALL_S + 1` then burst at B=2 x5, asserting
+  no `has not drained its stdin` line and `online` never False (+ B=0 x3, +
+  3 s idle B=2 x3); 11 = gulp child at SIZE=30 (+ `rate` child same mean, +
+  SIZE=500). `LEGS="9 10 11"` selects legs; the verdict judges only those.
+  LOAD rule: every B=2 run reports the writer's `poll_gap_median_ms` (only
+  trees with `_writer_observes`, only while flagged; preferred when >= 5 polls)
+  and `wake_gap_median_ms` (the main thread waiting `queue.get(timeout=
+  TX_PUT_WAIT_S)` through the quiet — tree-independent, but it under-reads the
+  writer by up to 8x on moc4). A HEALTHY B=2 run under 100 ms is UNKNOWN
+  (contention not reached), never GREEN; a DEFECTIVE one stays RED; an episode
+  run that never entered is UNKNOWN; a leg with any RED run is RED. Leg 9 uses
+  `PROVOKE_S=4` (burners start before the provoke, which slows entry). Legs
+  9-11 add ~9 min on a Pi 4. The index's first line says WHERE it ran (PAGESIZE,
+  F_GETPIPE_SZ, python, nproc, loadavg). A leg GREEN on every tree measured
+  nothing — the red baseline is what makes it a leg.
+- `drill_gil.py <tree> episode|control` (legs 9, 10) — the fresh pass's
+  `gilsticky.py`, copied with a source header; env `BURNERS`, `HOGS`,
+  `QUIET_S` (`stall+1` allowed), `LOW_GAP`, `BURST_WITH_AUX`,
+  `AUX_BEFORE_PROVOKE` (1 default; 0 = the reviewer's order), `PROVOKE_S`
+  (1.5 default). RESULT adds
+  `wake_gap_median_ms`, `offline_events`, `stall_lines`.
+- `drill_smallgulp.py <tree>` (leg 11) — the fresh pass's `smallgulp.py`,
+  copied; env `SIZE`, `FPS` (`auto` holds `OFFERED_BPS`, default 40000),
+  `GULP`, `SECS`, `CHILDMODE` (gulp|rate).
 - `drill_sticky.py <tree> episode|control` — the mf.9 non-author pass's drill,
   copied: episode, then offers `LOW_GAP` (0.7) s apart for `LOW_S` (10) s,
   then 2,000 x 500 B. On c3c52232 the flag stuck and the burst dropped

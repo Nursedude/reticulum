@@ -1,5 +1,6 @@
 """Verdict table for accept.sh: reads <outdir>/<run>.log + .rc and applies the
-HEALTHY readings named in accept.sh's header. Exit 0 = every leg GREEN, 1 = a
+HEALTHY readings named in accept.sh's header. Only the legs named in
+meta `legs=` are judged (default all 11). Exit 0 = every leg GREEN, 1 = a
 leg RED, 2 = a run missing or unparseable (UNKNOWN is never a pass)."""
 import os, re, sys
 OUT = sys.argv[1]
@@ -16,9 +17,13 @@ def result(n):
     if t is None: return None
     ls = [l for l in t.splitlines() if l.startswith("RESULT")]
     return kv(ls[-1]) if ls else None
+_meta = open(os.path.join(OUT, "meta")).read() if os.path.exists(os.path.join(OUT, "meta")) else ""
+_m = re.search(r"legs=([\d,]+)", _meta)
+LEGS = {int(x) for x in _m.group(1).split(",")} if _m else set(range(1, 9))   # pre-legs-9-11 outdirs
 rows = []; unknown = False
 def row(leg, ok, detail):
     global unknown
+    if int(leg.split()[0]) not in LEGS: return   # not selected for this run
     if ok is None: unknown = True
     rows.append((leg, "UNKNOWN" if ok is None else ("GREEN" if ok else "RED"), detail))
 
@@ -108,6 +113,64 @@ row("7 healthy burst 0 entered", None if r is None or rc("burst") != "0" else r[
 r = result("behind")
 row("8 behind rate 100000 stays", None if r is None or rc("behind") != "0" else (r["entries"] == "1" and r["exits"] == "0" and r["congested_end"] == "True"),
     "rc=%s %s" % (rc("behind"), "" if r is None else f"entries={r['entries']},exits={r['exits']},congested_end={r['congested_end']},dropped={r['dropped']}"))
+
+# --- legs 9-11 (added after the fresh pass on 8acd4d18, 2026-10-12; arc paused) ---
+# LOAD rule: a leg that claims to run under CPU contention must show the
+# contention. The witness is drill_gil.py's wake_gap_median_ms (the main thread
+# sleeping in TX_PUT_WAIT_S steps through the quiet -- tree-independent; the
+# writer's own poll witness exists only on trees with _writer_observes and only
+# while the flag is set; it is preferred when >= 5 polls were seen). A HEALTHY
+# B=2 run under LOAD_MIN_MS is UNKNOWN (contention not reached), never GREEN;
+# a DEFECTIVE one stays RED (on moc4 F1 reproduced at writer poll gaps of
+# 41-59 ms, so 100 ms is a floor for trusting a green, not the defect's edge).
+# A B=0 control at or over the floor is UNKNOWN (the control was loaded). An episode run that never
+# entered is UNKNOWN (the shape was not reached), never RED or GREEN.
+LOAD_MIN_MS = 100.0
+BURST_DROP_MAX = 100   # no-episode B=2 controls read 0-12 on moc4 (fresh pass)
+def gil_runs(names, healthy, leg):
+    # per-run state: R (defect read), U (unobservable / not reached), G.
+    # Leg: any R -> RED (a reproduced defect is proven); else any U -> UNKNOWN.
+    det = []; st = []
+    for n in names:
+        r = result(n)
+        if r is None or rc(n) != "0": st.append("U"); det.append(f"{n}:rc={rc(n)}"); continue
+        wg = float(r.get("wake_gap_median_ms", "-1")); b = int(r["B"])
+        pg = float(r.get("poll_gap_median_ms", "-1")); np_ = int(r.get("polls_in_quiet", "0"))
+        # the writer's own gap when it was observable (>= 5 polls), else the witness
+        lg, src = (pg, "poll") if np_ >= 5 else (wg, "wake")
+        load = f"load={lg:.0f}ms({src}),wake={wg:.0f},poll={pg:.0f}"
+        if b == 0 and lg >= LOAD_MIN_MS:
+            st.append("U"); det.append(f"{n}:UNKNOWN(B=0 control loaded, {load})"); continue
+        if "_ep_" in n and r["provoked"] != "True":
+            st.append("U"); det.append(f"{n}:UNKNOWN(episode not provoked, {load})"); continue
+        good = healthy(n, r)
+        tag = "G" if good else "R"
+        if good and b >= 2 and lg < LOAD_MIN_MS:
+            # healthy at a load under the floor measured nothing: never GREEN.
+            # A DEFECTIVE reading under the floor stays RED (the defect showed
+            # at less load than claimed -- a reading, not a vacuum).
+            tag = "U"
+        st.append(tag)
+        det.append(f"{n}:{tag},B={b},{load},provoked={r['provoked']},cbb={r['congested_before_burst']},burst_drops={r['burst_drops']},stall_lines={r.get('stall_lines')},offline={r.get('offline_events')}")
+    row(leg, False if "R" in st else (None if "U" in st else True), "; ".join(det))
+def h9(n, r):
+    return r["congested_before_burst"] == "False" and int(r["burst_drops"]) < BURST_DROP_MAX
+gil_runs(["gil9_ep_b2_1", "gil9_ep_b2_2", "gil9_ep_b2_3", "gil9_ep_b0", "gil9_ctl_b2"], h9,
+         "9 sticky under CPU contention B=2 x3 + B=0 + no-episode B=2")
+def h10(n, r):
+    return (r.get("stall_lines") == "0" and r.get("offline_events") == "0"
+            and r["congested_before_burst"] == "False" and int(r["burst_drops"]) < BURST_DROP_MAX)
+gil_runs([f"gil10_idle_b2_{k}" for k in range(1, 6)] + [f"gil10_idle_b0_{k}" for k in range(1, 4)]
+         + [f"gil10_q3_b2_{k}" for k in range(1, 4)], h10,
+         "10 idle TX_STALL_S+1 then burst B=2 x5 + B=0 x3 + 3s B=2 x3")
+det = []; ok = True
+for n in ("sg11_30_1", "sg11_30_2", "sg11_30_rate", "sg11_500"):
+    r = result(n)
+    if r is None or rc(n) != "0": ok = None; det.append(f"{n}:rc={rc(n)}"); continue
+    good = r["entries"] == "1" and r["exits"] == "0" and r["congested_end"] == "True"
+    if not good and ok is not None: ok = False
+    det.append(f"{n}:SIZE={r['SIZE']},CM={r['CM']},entries={r['entries']},exits={r['exits']},duty={r['duty']},congested_end={r['congested_end']}")
+row("11 gulp SIZE=30 x2 + rate ctl + SIZE=500", ok, "; ".join(det))
 
 meta = open(os.path.join(OUT, "meta")).read().strip() if os.path.exists(os.path.join(OUT, "meta")) else "meta missing"
 print(meta)
