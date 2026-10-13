@@ -23,13 +23,14 @@ fd = iface.process.stdin.fileno(); cap = fcntl.fcntl(fd, 1032)
 def occ(): return struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
 samples = []   # (t, waited_s, qsize_before, writable, occ)
 orig_note = iface._note_pipe_full
-entered = []
+entered = []; exited = []
 class Spy(type(iface)):
     @property
     def _tx_congested(self): return self.__dict__.get("_c", False)
     @_tx_congested.setter
     def _tx_congested(self, v):
         if v and not self.__dict__.get("_c", False): entered.append(time.monotonic())
+        if not v and self.__dict__.get("_c", False): exited.append(time.monotonic())
         self.__dict__["_c"] = v
 iface.__class__ = Spy
 size, rate = {"fast": (500, 2400.0), "gulp": (1000, 600.0), "slowgulp": (500, 600.0), "burst": (1000, None)}[scen]
@@ -51,6 +52,9 @@ elapsed = time.monotonic() - t0
 time.sleep(0.6)
 print(f"scenario={scen} pagesize={os.sysconf('SC_PAGESIZE')} cap={cap} py={sys.version.split()[0]}")
 print(f"offered={k} elapsed={elapsed:.2f}s busy={busy:.2f}s waits(>=15ms)={waits} dropped={iface.tx_dropped} entered={len(entered)} at={[round(e - t0, 2) for e in entered]}")
+# mf.10: exits are read up to the END of the offered run (the 0.6 s settle above
+# is after it), so "stays congested" means through the whole run.
+print(f"RESULT scenario={scen} entered={len(entered)} exits_during_run={sum(1 for e in exited if e - t0 <= elapsed)} congested_at_run_end={bool(entered) and not any(e - t0 <= elapsed for e in exited)} dropped={iface.tx_dropped}")
 if samples:
     import statistics as st
     occs = [s[4] / cap for s in samples]; wr = [s[3] for s in samples]; dts = [s[1] for s in samples]

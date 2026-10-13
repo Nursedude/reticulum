@@ -518,7 +518,7 @@ def program_setup(configdir, dispall=False, verbosity=0, name_filter=None, json=
                             state = "child behind, dropping now" if ifstat.get("tx_congested") else "child draining"
                             print("    Dropped   : {n} frame(s) ({s})".format(n=str(ifstat["tx_dropped"]), s=state))
                         if ifstat.get("tx_probe_errors"):
-                            print("    Pipe probe: {n} failed read(s) of the stdin pipe state (congestion gate degraded)".format(n=str(ifstat["tx_probe_errors"])))
+                            print("    Pipe probe: {n} failed read(s) of the stdin pipe state since the interface started (a running total, not the current state)".format(n=str(ifstat["tx_probe_errors"])))
 
                         if "channel_load_short" in ifstat and "channel_load_long" in ifstat:
                             print("    Ch. Load  : {ats}% (15s), {atl}% (1h)".format(ats=str(ifstat["channel_load_short"]),atl=str(ifstat["channel_load_long"])))

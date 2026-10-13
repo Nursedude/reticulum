@@ -28,11 +28,34 @@ No RNS instance is started; the fixture is `tests/meshforge_pipe_interface_stall
 - `drill_burst.py <tree> [ready]` — the healthy-burst test's exact shape with
   every `_note_pipe_full` call and every drop recorded; `ready` waits for the
   child's first read first (the mf.7 "1 drop" was frame 321 = 64 + 256 + 1).
+- `accept.sh <tree> <outdir> [python]` (mf.10) — the ACCEPTANCE run: every
+  known traffic shape at once, with its controls, sequentially, waiting for
+  loadavg < 1.0 before each run; rc per run to files, then a one-line-per-leg
+  verdict table (`accept_verdict.py`, exit 0 all GREEN / 1 a RED / 2 UNKNOWN).
+  The healthy and defective reading of each leg is in the script's header.
+  Drills come from this directory, the gate from `<tree>`, so it measures any
+  cut: run it on the parent BEFORE a change (the red baseline) and on the
+  change AFTER it. Legs: pulse x5 (+ behind control), tick 160k (+ 100k),
+  sticky 0.7 s x3 (+ 0.3 s, no episode), quiet-then-burst x3 (+ no episode),
+  slowgulp, hung (SIGSTOP), healthy burst, behind (`rate 100000`). ~4 min.
+- `drill_sticky.py <tree> episode|control` — the mf.9 non-author pass's drill,
+  copied: episode, then offers `LOW_GAP` (0.7) s apart for `LOW_S` (10) s,
+  then 2,000 x 500 B. On c3c52232 the flag stuck and the burst dropped
+  1,557-1,744 of 2,000.
+- `drill_shapes.py <tree> quietburst|quietctl|hung|behind` (mf.10) — episode
+  then NO offers for `QUIET_S` then the burst; a SIGSTOPped child held
+  `HOLD_S` under 1000 f/s; a `rate 100000` child under 300 kB/s. Prints one
+  `RESULT` line each.
+- `drill_writer_cpu.py <tree> idle|quietexit|hung|hungpoll [s]` (mf.10) — the
+  writer thread's CPU seconds and voluntary wakeups over a window, from
+  `/proc/<pid>/task/<tid>`; `hungpoll` is the poll's worst case (congested,
+  queue empty, pipe over the line and never changing).
 - `mutants8.sh <tree> <outdir> [python]` — pattern-anchored mutant matrix over
-  the whole stall file; `MUTS="a b"` selects a subset. Re-run the WHOLE matrix
-  after every fix (a fix can unpin an older leg), on both kernel classes. A
-  mutant whose pattern no longer matches reports `SED DID NOT APPLY` — re-anchor
-  it, never drop it. mf.9: 29 mutants (the mf.8 author's 11, the 9120f760
-  pass's 6, 12 aimed at the mf.9 changes); ~2.5 min each on a Pi 4.
+  the whole stall file; `MUTS="a b"` selects a subset, `FAILFAST=1` stops each
+  run at its first failure. Re-run the WHOLE matrix after every fix (a fix can
+  unpin an older leg), on both kernel classes. A mutant whose pattern no longer
+  matches reports `SED DID NOT APPLY` — re-anchor it, never drop it. mf.10: 40
+  mutants (mf.9's 29, the c3c52232 pass's 5, 6 aimed at the mf.10 exit
+  accounting); ~3 min each on a Pi 4 for a survivor, less when FAILFAST kills.
 
 First step of any pass: `getconf PAGESIZE` on every box the build ships to.

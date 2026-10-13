@@ -92,9 +92,10 @@ class PipeInterface(Interface):
     # interface ran 8 s median / 20 s worst). Once puts have waited with
     # the pipe full for TX_CONGEST_FULL_S the interface is congested: frames
     # are offered without waiting (dropped only if the queue is full) until
-    # the child has caught up across a window of TX_CONGEST_FULL_S of offers
-    # (1.3.8+mf.9: no drop, queue at or under TX_LOW_WATER, pipe under the
-    # line for most of the window — see _caught_up_for) — exit needs
+    # the child has caught up across a window of TX_CONGEST_FULL_S
+    # (1.3.8+mf.10: no drop, queue at or under TX_LOW_WATER, queue empty and
+    # pipe under the line for most of the window as observed by offers AND
+    # the writer's idle polls — see _caught_up_for) — exit needs
     # persistent evidence, as entry does. One caught-up sample was true with the child 1.3 s behind
     # whenever the queue dump fit in the emptied pipe: 502-B frames pack 32
     # to a 16 KB page, so 256 frames fill 8 of 16 pages and select() reads
@@ -188,6 +189,20 @@ class PipeInterface(Interface):
     #     as entry does (each offer standing for at most TX_PUT_WAIT_S), and
     #     ends it outright on what the domain loses: a dropped frame or a
     #     queue over low water (_caught_up_for).
+    # 1.3.8+mf.10 (2026-10-12, non-author pass on the mf.9 candidate, moc4):
+    # mf.9 restarted the exit window at any offer more than TX_CONGEST_FULL_S
+    # after the previous one, so under sparse traffic (< 2 frames/s) an
+    # episode never closed, and the next burst into a HEALTHY child met no
+    # back-pressure: 1,557-1,741 of 2,000 dropped (9120f760: 0). The gate has
+    # TWO observers and exit now uses both: an offer (one instant), and the
+    # writer, which polls every TX_PUT_WAIT_S while the interface is congested
+    # and sees the queue empty and the pipe under the line when the child has
+    # caught up. Each observation credits at most TX_PUT_WAIT_S of the time
+    # since the previous one (from EITHER observer), so a gap between offers
+    # is neither evidence nor a reset: the writer's polls fill it. The episode
+    # closes on a window of TX_CONGEST_FULL_S in which observed caught-up time
+    # exceeds observed backed-up time and covers at least half the window
+    # (_caught_up_for) — whether or not anyone offered.
     TX_PIPE_FULL_FRACTION = 0.5
     F_GETPIPE_SZ = getattr(fcntl, "F_GETPIPE_SZ", 1032)
 
@@ -220,6 +235,8 @@ class PipeInterface(Interface):
         self.bitrate  = PipeInterface.BITRATE_GUESS
         self.respawn_delay = respawn_delay
         self.tx_dropped = 0
+        # A LIFETIME count of failed pipe-state reads (every child this
+        # interface has run), never reset on respawn: rnstatus says so.
         self.tx_probe_errors = 0
         self._txq = queue.Queue(maxsize=PipeInterface.TX_QUEUE_DEPTH)
         self._tx_last_drain = time.monotonic()
@@ -232,8 +249,8 @@ class PipeInterface(Interface):
         self._tx_clear_since = None
         self._tx_clear_room = 0.0
         self._tx_clear_full = 0.0
-        self._tx_offer_last = 0.0
-        self._tx_offer_dropped = 0
+        self._tx_clear_last = 0.0
+        self._tx_exit_dropped = 0
         self._tx_episode_dropped = 0
         # Serializes the gate's accounting between sender threads and the
         # writer (non-author pass on 9120f760, F5): see _note_pipe_full.
@@ -286,9 +303,14 @@ class PipeInterface(Interface):
             # pass on b18aae01, F3: 2 of 3 respawned episodes had no line).
             RNS.log(f"{self} subprocess respawned mid-episode; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
         self._tx_stalled = False
-        self._tx_congested = False
-        self._tx_full_since = None
-        self._tx_clear_since = None
+        # Under the gate lock: a sender that passed the `online` check just
+        # before the old child died can still be inside _note_pipe_full, and
+        # an unlocked reset could interleave with its span arithmetic
+        # (non-author pass on c3c52232: PLAUSIBLE, not reproduced).
+        with self._tx_gate_lock:
+            self._tx_congested = False
+            self._tx_full_since = None
+            self._tx_clear_since = None
         self._pipe_cap = None   # a new child, a new pipe: re-read its capacity
         self._writer = threading.Thread(target=self._write_loop, args=(self._writer_gen, self.process), daemon=True,
                                         name=f"pipe-writer-{self.name}")
@@ -305,8 +327,12 @@ class PipeInterface(Interface):
     def process_outgoing(self,data):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
-            if self._tx_congested and self._caught_up_for(time.monotonic()):
-                self._end_episode()
+            if self._tx_congested:
+                # An offer is one of the exit rule's two observers (the
+                # writer's idle poll is the other): the clock is read before
+                # the state it stamps.
+                now = time.monotonic()
+                if self._caught_up_for(now, self._child_caught_up()): self._end_episode()
             # One clock read before the put: the sample below is credited
             # with the time THIS put waited, never more (see _note_pipe_full).
             t = time.monotonic()
@@ -325,8 +351,9 @@ class PipeInterface(Interface):
                     # timed-out put if the pipe is backed up (see TX_CONGEST_FULL_S).
                     if throttled or now - t >= PipeInterface.TX_PUT_WAIT_S / 2: self._note_pipe_full(now, now - t)
             except queue.Full:
-                # A drop. While congested the exit rule sees it at the next
-                # offer (tx_dropped moved) and restarts its window.
+                # A drop. While congested the exit rule sees it at its next
+                # observation, offer or writer poll (tx_dropped moved), and
+                # restarts its window.
                 now = time.monotonic()
                 self._note_pipe_full(now, now - t)
                 self.tx_dropped += 1
@@ -397,12 +424,16 @@ class PipeInterface(Interface):
                 self._tx_congested = True
                 self._tx_clear_since = None
                 self._tx_episode_dropped = self.tx_dropped
-                self._tx_offer_dropped = self.tx_dropped
-                RNS.log(f"{self} subprocess is behind (callers waited {full_for:.2f}s for a queue slot with its stdin pipe at least {PipeInterface.TX_PIPE_FULL_FRACTION:.0%} full); offering without waiting and dropping what the queue cannot hold until {PipeInterface.TX_CONGEST_FULL_S:.1f}s of offers pass with no drop, the queue at or under {PipeInterface.TX_LOW_WATER} and the pipe under {PipeInterface.TX_PIPE_FULL_FRACTION:.0%} for most of that time", RNS.LOG_WARNING)
+                self._tx_exit_dropped = self.tx_dropped
+                RNS.log(f"{self} subprocess is behind (callers waited {full_for:.2f}s for a queue slot with its stdin pipe at least {PipeInterface.TX_PIPE_FULL_FRACTION:.0%} full); offering without waiting and dropping what the queue cannot hold until a {PipeInterface.TX_CONGEST_FULL_S:.1f}s window passes with no drop, the queue at or under {PipeInterface.TX_LOW_WATER}, and the queue empty with the pipe under {PipeInterface.TX_PIPE_FULL_FRACTION:.0%} for most of it (observed by offers and by the writer's polls)", RNS.LOG_WARNING)
 
-    def _end_span(self):
+    def _end_span(self, observed_at):
+        # The writer read "caught up" at `observed_at`, outside the lock (the
+        # ioctl stays outside it). A span a sender opened AFTER that read was
+        # opened on a sample the writer's read cannot speak for: keep it
+        # (non-author pass on c3c52232: the read was unlocked before the clear).
         with self._tx_gate_lock:
-            self._tx_full_since = None
+            if self._tx_full_since is not None and self._tx_full_since <= observed_at: self._tx_full_since = None
 
     def _end_episode(self):
         with self._tx_gate_lock:
@@ -412,56 +443,74 @@ class PipeInterface(Interface):
             self._tx_clear_since = None
             RNS.log(f"{self} subprocess has caught up; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
 
-    def _caught_up_for(self, now):
-        # Called on every offer while congested: True once a window of at
-        # least TX_CONGEST_FULL_S of offers has passed with no frame dropped,
-        # the queue at or under TX_LOW_WATER at every offer, and the child
-        # caught up (queue empty, pipe under the line) for MORE of that time
-        # than not — the same weighing, and the same constant, as entry (hfm
-        # #5). 9120f760 required EVERY offer in the window to be caught up: a
-        # child that keeps up on a timer (reads all of it every 0.25 s) leaves
-        # ~39 KB in a 64 KB pipe at the end of each tick at 160 kB/s, ~28 of
-        # 160 offers/s landed above the 32 KB line, and the episode never
-        # closed — 10 s, drops flat at 175 (non-author pass, F4, moc4). What
-        # the domain loses is frames: a drop or a queue over low water ends
-        # the window outright; a pipe that is over the line for most of a
-        # window is a child still holding a backlog (a gulp child after the
-        # queue dump on 16 KB pages), and that window is simply not enough
-        # evidence — the next one starts. A gap of more than
-        # TX_CONGEST_FULL_S between offers is unobserved time, not caught-up
-        # time: the window restarts at the offer after it. With no offers the
-        # flag holds; nothing is lost while nothing is offered.
-        caught_up = self._child_caught_up()
+    def _caught_up_for(self, now, caught_up=None):
+        # One exit accounting for BOTH observers, under the gate lock: an
+        # offer while congested (process_outgoing) and the writer's idle poll
+        # (_writer_observes), each saying at `now` whether the child is caught
+        # up (queue empty AND pipe under the line, _child_caught_up). True once
+        # a window of at least TX_CONGEST_FULL_S has passed with no frame
+        # dropped, the queue at or under TX_LOW_WATER at every observation,
+        # and observed caught-up time both exceeding observed backed-up time
+        # and covering at least half the window.
+        #   * Credit is OBSERVED time only: each observation stands for at
+        #     most TX_PUT_WAIT_S of the time since the previous one, whichever
+        #     observer made it (an offer observes one instant; the writer
+        #     polls every TX_PUT_WAIT_S, so its polls tile the quiet).
+        #   * What the domain loses ends the window outright: a drop since the
+        #     previous observation, or a queue over low water.
+        #   * A gap between offers is NOT evidence and NOT a reset. mf.9
+        #     restarted the window at any offer more than TX_CONGEST_FULL_S
+        #     after the last, so at < 2 offers/s an episode never closed, and
+        #     the next burst into a healthy child was dropped: 1,557-1,741 of
+        #     2,000 (non-author pass on c3c52232, sticky drill, moc4; 9120f760
+        #     0). Time nobody observed simply credits nothing: a window that
+        #     was observed for less than half its length cannot close.
+        #   * A window backed up for most of its observed time — a tick child
+        #     still draining a backlog, a gulp child after a queue dump — is
+        #     not enough evidence; the next one starts (9120f760 required
+        #     EVERY offer under the line, and a tick child that keeps up never
+        #     closed: non-author pass on 9120f760, F4).
+        if caught_up is None: caught_up = self._child_caught_up()
         with self._tx_gate_lock:
-            last_offer = self._tx_offer_last
-            self._tx_offer_last = now
-            dropped = self.tx_dropped != self._tx_offer_dropped
-            self._tx_offer_dropped = self.tx_dropped
+            if not self._tx_congested: return False
+            dropped = self.tx_dropped != self._tx_exit_dropped
+            self._tx_exit_dropped = self.tx_dropped
             if dropped or self._txq.qsize() > PipeInterface.TX_LOW_WATER:
                 self._tx_clear_since = None
                 return False
             since = self._tx_clear_since
-            if since is None or now - last_offer > PipeInterface.TX_CONGEST_FULL_S:
-                self._tx_clear_since = now
+            last = self._tx_clear_last
+            if since is None:
+                self._tx_clear_since = self._tx_clear_last = now
                 self._tx_clear_room = self._tx_clear_full = 0.0
                 return False
-            gap = now - last_offer if now > last_offer else 0.0
-            # An offer observes one instant: it stands for at most one put
-            # wait of the time around it, never for the whole gap since the
-            # last offer — a sender descheduled for 0.4 s that offers just
-            # after the child read would otherwise book 0.4 s of room it never
-            # saw (the F1 class, on the exit side).
+            gap = max(0.0, now - last)
+            if now > last: self._tx_clear_last = now
             credit = min(gap, PipeInterface.TX_PUT_WAIT_S)
             if caught_up: self._tx_clear_room += credit
             else: self._tx_clear_full += credit
             if now - since < PipeInterface.TX_CONGEST_FULL_S:
                 return False
-            if self._tx_clear_room > self._tx_clear_full:
+            observed_room = self._tx_clear_room >= PipeInterface.TX_CONGEST_FULL_S / 2
+            if self._tx_clear_room > self._tx_clear_full and observed_room:
                 return True
-            # A window that was backed up for most of its time: the next one.
-            self._tx_clear_since = now
+            # Backed up for most of what was observed, or too little observed:
+            # the next window.
+            self._tx_clear_since = self._tx_clear_last = now
             self._tx_clear_room = self._tx_clear_full = 0.0
             return False
+
+    def _writer_observes(self, now=None):
+        # The writer's idle poll (its queue wait timed out: nothing to write).
+        # It ends a pipe-full span over a child that has caught up (the quiet
+        # after a burst, non-author pass on 9120f760, F1), and while the
+        # interface is congested it is the exit rule's observer when nobody
+        # offers. Only while online: a dead or stalled child is not observed.
+        if now is None: now = time.monotonic()
+        caught_up = self._child_caught_up()
+        if caught_up: self._end_span(now)
+        if not self.online: return
+        if self._tx_congested and self._caught_up_for(now, caught_up): self._end_episode()
 
     def _child_caught_up(self):
         # Caught up means NOTHING is backed up: the queue is empty AND the
@@ -471,7 +520,8 @@ class PipeInterface(Interface):
         # pipe — queue empty, pipe full again, child still behind — and the
         # gate re-armed every cycle (fresh pass on 925d275c, F1: 9 episodes in
         # 30 s, reader duty 0.31 vs 0.02). Checked by the writer after a
-        # write while a span is open, and by the caller while congested.
+        # write while a span is open, by the writer's idle poll while a span is
+        # open or the interface congested, and by the caller while congested.
         return self._txq.qsize() == 0 and not self._pipe_full()
 
     def _pipe_full(self):
@@ -528,16 +578,17 @@ class PipeInterface(Interface):
     def _write_loop(self, gen, process):
         while gen == self._writer_gen and not self.detached:
             try:
-                # While a pipe-full span is open the writer looks at the pipe
-                # whenever it is idle, so the quiet after a burst is OBSERVED:
-                # the caught-up check after a write sees the pipe the burst's
-                # last write left over the line, and nothing re-checked it
-                # (non-author pass on 9120f760, F1: `occ=0 qsize=0` between
-                # pulses with the span still open).
-                data = self._txq.get(timeout=PipeInterface.TX_PUT_WAIT_S if self._tx_full_since is not None else 0.5)
+                # While a pipe-full span is open OR the interface is congested
+                # the writer looks at the pipe whenever it is idle, every
+                # TX_PUT_WAIT_S, so the quiet is OBSERVED: after a burst the
+                # pipe its last write left over the line (non-author pass on
+                # 9120f760, F1), and through quiet in an episode, when no
+                # offer arrives to observe anything (non-author pass on
+                # c3c52232). Otherwise 0.5 s. Cost measured in FORK.md mf.10.
+                watching = self._tx_full_since is not None or self._tx_congested
+                data = self._txq.get(timeout=PipeInterface.TX_PUT_WAIT_S if watching else 0.5)
             except queue.Empty:
-                if self._tx_full_since is not None:
-                    if self._child_caught_up(): self._end_span()
+                if watching: self._writer_observes()
                 continue
             if gen != self._writer_gen or self.detached:
                 # Retired while waiting: hand the frame back for the live
@@ -557,8 +608,9 @@ class PipeInterface(Interface):
             self._tx_last_drain = time.monotonic()
             # The burst was absorbed: a pipe-full span that began before it
             # does not carry into the next one.
+            seen = time.monotonic()
             if self._tx_full_since is not None and self._child_caught_up():
-                self._end_span()
+                self._end_span(seen)
             if written != len(data):
                 RNS.log("Pipe interface only wrote "+str(written)+" bytes of "+str(len(data)), RNS.LOG_ERROR)
             if (self._tx_stalled and gen == self._writer_gen and self.pipe_is_open and not self.detached

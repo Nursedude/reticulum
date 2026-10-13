@@ -1127,16 +1127,180 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertIsNotNone(at, "never caught up after the queue drained")
         self.assertGreaterEqual(at - 1000.0, 1.4 * S - 1e-9, f"caught up at {(at - 1000.0) / S:.2f} S with the queue over low water at 0.4 S")
 
-    def test_a_quiet_gap_between_offers_restarts_the_exit_window(self):
-        """No offers for longer than TX_CONGEST_FULL_S is unobserved time,
-        not caught-up time: the window restarts at the next offer (quiet is
-        not behind, but it is not evidence either; the flag holds until offers
-        show it)."""
+    # ---- 1.3.8+mf.10: non-author pass on c3c52232 (2026-10-12, moc4 4 KB) ----
+    # mf.9 pinned "a quiet gap between offers restarts the exit window" here
+    # (test_a_quiet_gap_between_offers_restarts_the_exit_window). That test
+    # pinned the DEFECT: at < 2 offers/s an episode never closed and the next
+    # burst into a healthy child was dropped (1,557-1,741 of 2,000). It is
+    # replaced by the principle: only observed time counts, and the writer's
+    # idle poll is an observer — during quiet, the only one.
+
+    def _writer_poll(self, now):
+        """One writer idle poll at an explicit clock (the writer's queue wait
+        timed out). On a tree whose writer has no exit observer (c3c52232 and
+        before) this is what its idle poll did: end a span over a caught-up
+        child, and nothing else — so a test of the principle FAILS there."""
+        f = getattr(self.iface, "_writer_observes", None)
+        if f is not None: f(now)
+        elif self.iface._tx_full_since is not None and self.iface._child_caught_up(): self.iface._end_span()
+
+    def test_writer_polls_that_see_the_child_caught_up_close_the_episode_without_offers(self):
+        """(i) The principle, explicit clock: congested, NO offers, the writer
+        polling every TX_PUT_WAIT_S and seeing the queue empty and the pipe
+        under the line. Quiet + drained, observed by the writer, IS caught up:
+        the episode closes after one window of TX_CONGEST_FULL_S, whether or
+        not anyone offered (mf.9: the flag held through quiet, so the next
+        burst met no back-pressure)."""
         S = self._congested_parked()
-        times = [1000.0] + [1000.0 + 1.2 * S + i * 0.05 * S for i in range(40)]
-        at = self._exit_offers(times)
-        self.assertIsNotNone(at, "never caught up after the quiet")
-        self.assertGreaterEqual(at - 1000.0, 2.2 * S - 1e-9, f"caught up at {(at - 1000.0) / S:.2f} S: the quiet gap was counted as caught up")
+        W = PI.PipeInterface.TX_PUT_WAIT_S
+        self.iface._pipe_full = lambda: False
+        closed = None
+        for k in range(int(4 * S / W) + 1):
+            t = 1000.0 + k * W
+            self._writer_poll(t)
+            if not self.iface._tx_congested: closed = t - 1000.0; break
+        self.assertIsNotNone(closed, f"writer polls saw the queue empty and the pipe under the line for {4 * S:.1f}s with no offer, and the episode never closed")
+        self.assertGreaterEqual(closed, S - 1e-9, f"closed at {closed:.3f}s, before a whole window")
+        self.assertLessEqual(closed, 1.2 * S, f"closed only at {closed / S:.2f} S")
+
+    def test_writer_polls_that_see_the_pipe_backed_up_outweigh_a_few_caught_up_offers(self):
+        """(ii) Every observer counts, both ways: the writer's polls see the
+        pipe over the line (a child still holding a backlog) while three
+        offers 0.4 S apart happen to land on caught-up instants. Observed
+        backed-up time is ~16x the caught-up time: the episode must hold.
+        mf.9 ignored the writer and closed on the offers alone."""
+        S = self._congested_parked()
+        W = PI.PipeInterface.TX_PUT_WAIT_S
+        events = [(1000.0 + k * W, "poll") for k in range(int(3 * S / W))] + \
+                 [(1000.0 + 0.0013 + j * 0.4 * S, "offer") for j in range(8)]
+        closed = None
+        for t, kind in sorted(events):
+            if kind == "poll":
+                self.iface._pipe_full = lambda: True
+                self._writer_poll(t)
+            else:
+                self.iface._pipe_full = lambda: False
+                if self.iface._caught_up_for(t): self.iface._end_episode()
+            if not self.iface._tx_congested: closed = t - 1000.0; break
+        self.assertIsNone(closed, f"closed at {closed} s on caught-up offers while the writer's polls saw the pipe backed up for the rest of the window")
+
+    def test_writer_polls_while_offline_do_not_close_the_episode(self):
+        """Pin: the writer observes only a LIVE child. Offline (a dead child
+        before its respawn, or a stall) its polls of the old pipe are not a
+        child catching up, and must not log "caught up" about it."""
+        S = self._congested_parked()
+        W = PI.PipeInterface.TX_PUT_WAIT_S
+        self.iface._pipe_full = lambda: False
+        self.iface.online = False
+        try:
+            for k in range(int(3 * S / W)): self._writer_poll(1000.0 + k * W)
+            self.assertTrue(self.iface._tx_congested, "the writer's polls of an offline child's pipe closed the episode")
+        finally:
+            self.iface.online = True
+
+    def _provoke_episode(self):
+        """SIGSTOP a reading child and offer 500 B until the interface
+        congests; then SIGCONT. The child is healthy from here on."""
+        self._wait_child_reading()
+        os.kill(self.child_pid, signal.SIGSTOP)
+        try:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not self.iface.tx_congested: self.iface.process_outgoing(b"s" * 500)
+        finally:
+            os.kill(self.child_pid, signal.SIGCONT)
+        self.assertTrue(self.iface.tx_congested, "a SIGSTOPped child never congested; the shape is vacuous")
+
+    def _burst_drops(self, n=2000, size=500):
+        d0 = self.iface.tx_dropped
+        done, worst = self._send_many(n, size=size, budget_s=20.0)
+        self.assertTrue(done, "the burst did not finish")
+        time.sleep(0.5)
+        return self.iface.tx_dropped - d0
+
+    def test_sparse_offers_after_an_episode_close_it_and_a_burst_is_back_pressured(self):
+        """(iii) The non-author pass's sticky drill (c3c52232, moc4): episode,
+        child resumed, then offers 0.7 s apart into the drained child, then a
+        2,000 x 500 B burst. mf.9: still congested after 9.8 s of sparse
+        traffic (occ=0, qsize=0, 0 drops), then 1,557-1,741 of 2,000 dropped;
+        9120f760 0. Healthy: the flag is clear by the end of the sparse phase,
+        and the burst is back-pressured and delivered."""
+        self._provoke_episode()
+        time.sleep(1.0)
+        d0 = self.iface.tx_dropped
+        for _ in range(8):
+            self.iface.process_outgoing(b"l" * 500); time.sleep(0.7)
+        stuck = self.iface.tx_congested; sparse_drops = self.iface.tx_dropped - d0
+        drops = self._burst_drops()
+        self.assertFalse(stuck or drops, f"after 5.6 s of offers 0.7 s apart into a drained child ({sparse_drops} dropped) congested={stuck}; then the burst dropped {drops} of 2000")
+
+    def test_quiet_then_burst_after_an_episode_drops_nothing(self):
+        """(iv) Quiet-then-burst: episode, child resumed, then NO offers at all
+        for 3 s, then 2,000 x 500 B. Nobody offers, so the writer is the only
+        observer of the quiet; queue empty and pipe drained is observed caught
+        up and closes the episode BEFORE the burst (mf.9: the flag held and the
+        burst met no back-pressure)."""
+        self._provoke_episode()
+        time.sleep(3.0)
+        stuck = self.iface.tx_congested; occ = self._pipe_buffered(); q = self.iface._txq.qsize()
+        drops = self._burst_drops()
+        self.assertFalse(stuck or drops, f"after 3 s with no offers (occ={occ}, qsize={q}) congested={stuck}; then the burst dropped {drops} of 2000")
+
+    def test_sparse_offers_alone_observe_too_little_to_close_an_episode(self):
+        """Pin (the coverage half of the exit rule): an observation credits at
+        most TX_PUT_WAIT_S, so with the writer parked (no polls — a writer
+        that cannot run observes nothing) offers 0.6 S apart observe ~0.04 S
+        of each window. Unobserved time is not caught-up time: no exit."""
+        S = self._congested_parked()
+        self.iface._pipe_full = lambda: False
+        at = self._exit_offers([1000.0 + j * 0.6 * S for j in range(12)])
+        self.assertIsNone(at, f"closed at {at}: {PI.PipeInterface.TX_PUT_WAIT_S}s of observation per offer closed a window")
+
+    def test_a_put_that_waited_under_the_floor_without_a_full_queue_does_not_sample(self):
+        """Pin (review mutant `waitfloor20` survived c3c52232's file): a put
+        that did NOT find the queue full samples the pipe only if it waited at
+        least TX_PUT_WAIT_S / 2 — a shorter wait is the writer being
+        scheduled, not evidence. 4 ms (under the 10 ms floor) must not
+        sample; 15 ms must."""
+        noted = []
+        self.iface._note_pipe_full = lambda now, *a, **k: noted.append(now)
+        class SlowQueue:
+            def __init__(self, d): self.d = d
+            def full(self): return False
+            def put(self, data, timeout=None): time.sleep(self.d)
+            def put_nowait(self, data): return None
+            def qsize(self): return 0
+        W = PI.PipeInterface.TX_PUT_WAIT_S
+        self.iface._txq = SlowQueue(0.2 * W)
+        self.iface.process_outgoing(b"t" * 500)
+        self.assertEqual(noted, [], f"a put that waited ~{0.2 * W * 1000:.0f} ms with the queue not full sampled the pipe")
+        self.iface._txq = SlowQueue(0.75 * W)
+        self.iface.process_outgoing(b"t" * 500)
+        self.assertEqual(len(noted), 1, f"a put that waited ~{0.75 * W * 1000:.0f} ms did not sample the pipe")
+
+    def test_a_span_opened_after_the_writers_read_survives_its_clear(self):
+        """Pin (the unlocked read before `_end_span`, non-author pass on
+        c3c52232): the writer reads "caught up" outside the lock, then clears
+        the span. A span a sender opened AFTER that read was opened on a
+        backed-up sample the read cannot speak for, and must survive; a span
+        older than the read is cleared."""
+        self._park_writer()
+        self.iface._tx_full_since = 1000.5
+        f = self.iface._end_span
+        if "observed_at" in inspect.signature(f).parameters: f(1000.0)
+        else: f()
+        self.assertEqual(self.iface._tx_full_since, 1000.5, "a span opened after the writer's caught-up read was cleared by it")
+        f(1001.0)
+        self.assertIsNone(self.iface._tx_full_since, "a span older than the writer's read was not cleared")
+
+    def test_rnstatus_names_probe_errors_as_a_running_total(self):
+        """tx_probe_errors is a lifetime count across every child: rnstatus
+        must not read one transient ioctl error as a gate degraded NOW."""
+        import RNS.Utilities.rnstatus as rs
+        src = inspect.getsource(rs)
+        line = [l for l in src.splitlines() if "Pipe probe:" in l]
+        self.assertEqual(len(line), 1, line)
+        self.assertIn("running total", line[0])
+        self.assertNotIn("degraded", line[0])
 
     def test_a_late_offer_does_not_book_the_gap_before_it_as_room(self):
         """The F1 class on the exit side: an offer observes one instant. A

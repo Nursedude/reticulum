@@ -102,6 +102,281 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### `1.3.8+mf.10` (UNRELEASED) — the congestion gate's exit uses BOTH of its observers, so quiet that the writer observed drained closes an episode, and an offer gap is no longer a reset
+
+Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2,
+`F_GETPIPE_SZ` 65536 → the 50 % line is 32 KB). This is an AUTHOR's cut: it
+carries no non-author pass and is not tagged; `RNS/_version.py` is not bumped
+(it still reads mf.7 — the bump belongs to the release commit). The spec is the
+fresh non-author pass on `c3c52232` (the mf.9 candidate), which found it NOT
+tag-ready with one defect mf.9 introduced, confirmed live 3/3 with an A/B.
+
+**The pattern this cut was built against.** Three cuts, three strangers, three
+reds — and each red was a defect the PREVIOUS cut's own tests pinned as
+correct: mf.7's `anyroom`, mf.9's `test_a_quiet_gap_between_offers_restarts_
+the_exit_window` (the single test killing `quietexit`/`stickyhold`). Each cut
+cured the SHAPE the last pass found. mf.10 is built from a stated principle
+and accepted against EVERY known shape at once (`accept.sh`, below), before
+and after the change, on the parent, on itself, and on mf.8.
+
+**The principle.** The gate credits only time some observer actually
+OBSERVED, and it uses every observer it has. It has two:
+
+1. **An offer** — one instant, worth at most `TX_PUT_WAIT_S` of the time
+   around it (mf.9 got this right on entry and on exit).
+2. **The writer** — while a pipe-full span is open OR the interface is
+   congested, its idle queue wait is `TX_PUT_WAIT_S` (else 0.5 s), and every
+   timed-out wait is a poll: queue empty by construction, pipe read by FIONREAD.
+   During quiet between offers the writer is the ONLY observer, and what it
+   sees — queue empty AND pipe under the line — is observed caught-up time.
+
+**What the c3c52232 pass measured (moc4, `~/mf9-review/out/drills/`).**
+`PipeInterface.py:444` restarted the exit window at any offer more than
+`TX_CONGEST_FULL_S` after the previous one. Under sparse traffic (< 2 frames/s)
+every offer restarted it, so an episode NEVER closed; while stuck there is no
+back-pressure, so the next burst into a perfectly healthy child was dropped.
+`sticky.py` (SIGSTOP-provoke → SIGCONT → 14 offers 0.7 s apart → 2,000 × 500 B):
+`congested=True` after 9.8 s of healthy traffic (occ=0, qsize=0, 0 drops), then
+`drops=1557/1741/1739 of 2000`; `9120f760` 0 and 0; no-episode control 0/0/0;
+0.3 s gaps exited, 0 drops. Lesser: `_child_caught_up()` read outside
+`_tx_gate_lock` before `_end_span`, `configure_pipe` reset gate state unlocked
+(PLAUSIBLE, not reproduced); `tx_probe_errors` cumulative across children reads
+"degraded" in rnstatus forever after one transient ioctl error; the mutant
+`waitfloor20` (the `TX_PUT_WAIT_S / 2` sampling floor) survived.
+
+What changed (`RNS/Interfaces/PipeInterface.py`, `RNS/Utilities/rnstatus.py`):
+
+1. **One exit accounting for both observers** (`_caught_up_for(now,
+   caught_up)`, under `_tx_gate_lock`). Each observation — an offer while
+   congested, or a writer poll (`_writer_observes`) — credits `min(time since
+   the previous observation by EITHER observer, TX_PUT_WAIT_S)` to caught-up
+   (queue empty and pipe under the line) or not. The exact rule:
+   - a frame dropped since the previous observation, or the queue over
+     `TX_LOW_WATER`, ends the window (what the domain loses) — unchanged;
+   - the first observation after that opens a window and credits nothing;
+   - when the window is `TX_CONGEST_FULL_S` old the episode closes if
+     observed caught-up time **exceeds** observed backed-up time **and covers
+     at least half the window** (`TX_CONGEST_FULL_S / 2`); otherwise the next
+     window starts at that observation;
+   - **an offer GAP is not evidence either way and is no longer a reset** —
+     the writer's polls fill it. Time nobody observed credits nothing, and a
+     window observed for less than half its length cannot close (that is what
+     the gap reset was trying to say, stated in observed time instead of in
+     offers). With the queue empty and the pipe under the line for
+     `TX_CONGEST_FULL_S` of polls, the episode closes whether or not anyone
+     offered: quiet + drained, observed, IS caught up.
+   - A child genuinely behind stays congested by the same rule: its polls (if
+     the writer is idle at all) and its offers see the pipe over the line, or
+     the queue over low water, or drops.
+2. **The writer polls while congested**, not only while a span is open
+   (`watching = span open or congested`), and closes the episode itself
+   (`_end_episode`) when its observation completes a window. It observes only
+   while `online`: a dead child's pipe before its respawn, or a stalled one,
+   is not a child catching up (and must not log "caught up" about it).
+3. **Poll cadence and cost — decision: no back-off.** `TX_PUT_WAIT_S` while
+   watching, 0.5 s otherwise (so it already falls back once an episode has
+   closed). Measured on moc4 (`drill_writer_cpu.py`, writer thread
+   `/proc/<pid>/task/<tid>`, 10 s windows, CLK_TCK 100):
+
+   | state | writer CPU / 10 s | wakeups/s |
+   |---|---|---|
+   | idle, never congested | 0.000 s | 1.9 |
+   | congested, child resumed, nothing offered (the polls close it, then 0.5 s) | 0.010 s (0.10 %) | 3.7 (18 caught-up checks) |
+   | hung child (SIGSTOP held; pipe full, writer wedged in a write) | 0.000 s | 0.0 |
+   | worst case: congested, child stopped with the pipe at 40 KB (over the line, under full), queue empty — polls a pipe that never changes | 0.080 s (0.80 %) | 49.4 |
+
+   The worst case costs twice mf.9's 0.4 % (each poll now runs the exit
+   accounting under the lock as well as the span check), at 8 ticks of
+   resolution, and only arises for a child stopped with its pipe between half
+   and full and nothing more offered — a stopped child that is offered to
+   fills its pipe and wedges the writer (0 wakeups). A back-off would make the
+   observer the exit depends on sparser exactly while it is the only one;
+   bounded at < 1 % of a Pi 4 core, that trade was not worth a new state.
+4. **Locks** (both fixed, not justified): `_end_span(observed_at)` clears a
+   span only if it opened at or before the writer's caught-up read (taken
+   before the ioctl, outside the lock); a span a sender opened after that read
+   survives. `configure_pipe` resets the gate's state under `_tx_gate_lock`.
+5. **`tx_probe_errors` — decision: a lifetime count, worded as one.** Not reset
+   per child (a respawn would erase the only witness of a probe that fails on
+   every child). rnstatus now reads `Pipe probe: N failed read(s) of the stdin
+   pipe state since the interface started (a running total, not the current
+   state)`. Not rendered against a live rnsd (tested on the source line).
+
+**Tests (`tests/meshforge_pipe_interface_stall.py`, 49 → 57).** REMOVED:
+`test_a_quiet_gap_between_offers_restarts_the_exit_window` — it pinned the
+defect. Red-first — the final 57-test file run against the `c3c52232` gate on
+moc4 (`tree_c3red` = this tree with `PipeInterface.py` and `rnstatus.py` from
+`c3c52232`, gate md5 `2c25c69ed3c9`, identical to the pass's tree): `Ran 57 …
+FAILED (failures=7)`, rc=1 (and the same 7 on the 56-test draft before the
+offline pin was added):
+
+| test | on `c3c52232` (moc4) |
+|---|---|
+| (i) `test_writer_polls_that_see_the_child_caught_up_close_the_episode_without_offers` (explicit clock) | `writer polls saw the queue empty and the pipe under the line for 2.0s with no offer, and the episode never closed` |
+| (ii) `test_writer_polls_that_see_the_pipe_backed_up_outweigh_a_few_caught_up_offers` (explicit clock) | `closed at 0.6013… s on caught-up offers while the writer's polls saw the pipe backed up for the rest of the window` |
+| (iii) `test_sparse_offers_after_an_episode_close_it_and_a_burst_is_back_pressured` (live, the sticky shape) | `after 5.6 s of offers 0.7 s apart into a drained child (0 dropped) congested=True; then the burst dropped 1730 of 2000` |
+| (iv) `test_quiet_then_burst_after_an_episode_drops_nothing` (live) | `after 3 s with no offers (occ=0, qsize=0) congested=True; then the burst dropped 1743 of 2000` |
+| `test_sparse_offers_alone_observe_too_little_to_close_an_episode` (coverage) | `closed at 1000.6: 0.02s of observation per offer closed a window` |
+| `test_a_span_opened_after_the_writers_read_survives_its_clear` (lock) | `None != 1000.5 : a span opened after the writer's caught-up read was cleared by it` |
+| `test_rnstatus_names_probe_errors_as_a_running_total` | `'running total' not found in '… (congestion gate degraded)…'` |
+
+Two pins pass on `c3c52232` by design: `test_a_put_that_waited_under_the_
+floor_without_a_full_queue_does_not_sample` (`waitfloor20`: a 4 ms put with the
+queue not full must not sample, a 15 ms one must) and `test_writer_polls_while_
+offline_do_not_close_the_episode` (`offlineobs`). The explicit-clock tests feed
+writer polls through `_writer_poll(now)`, which on a tree without
+`_writer_observes` does what that tree's idle poll did (end a span, nothing
+else), so they FAIL there instead of ERRORing. Every other mf.9 test is kept;
+none needed its assertion changed.
+
+**Acceptance — `tests/meshforge_pipe_tools/accept.sh`, one script, 8 legs with
+their controls, sequential at load < 1.0, rc per run to files (healthy and
+defective readings in its header).** moc4, same session, three trees:
+
+| leg | `c3c52232` (mf.9, parent — red baseline) | **this tree** (mf.10) | `9120f760` (mf.8 — second control) |
+|---|---|---|---|
+| 1 pulse ×5 + ctl | GREEN — 0/5 entered, drops 0,0,0,1,2, 0 spans over `occ=0 qsize=0`; ctl `RATE=100000` entered 0.54 s | GREEN — 0/5, drops 1,0,1,1,0, 0 spans; ctl 0.52 s | **RED** — 0/5 entered, but 10,11,5,10,8 pre-pulse lines with a span open over a drained pipe (the F1 mechanism); ctl 0.54 s |
+| 2 tick 160k + 100k | GREEN — closed ≤ 4 s into the hold, drops flat at 175; 100k ≤ 3 s | GREEN — ≤ 4 s, flat at 175; 100k ≤ 3 s | **RED** — 160k never closed in the 10 s hold (175 dropped); 100k ≤ 3 s |
+| 3 sticky 0.7 s ×3 + 0.3 s + no episode | **RED** — still congested after 9.8 s of sparse traffic ×3, burst dropped 1,731 / 1,744 / 473 of 2,000; 0.3 s 0; no episode 0 | GREEN — cleared ×3, burst 0 / 0 / 0; 0.3 s 0; no episode 0 | GREEN — cleared ×3, 0 / 0 / 0; 0.3 s 0; no episode 0 |
+| 4 quiet-then-burst ×3 + ctl | **RED** — flag set before the burst ×3, dropped 1,737 / 980 / 920; ctl 0 | GREEN — cleared before the burst ×3, 0 / 0 / 0; ctl 0 | **RED** — set ×3, 1,744 / 1,743 / 1,738; ctl 0 |
+| 5 slowgulp 10 s | GREEN — 1 entry, 0 exits (1,645 dropped) | GREEN — 1, 0 (1,630) | GREEN — 1, 0 (1,645) |
+| 6 hung (SIGSTOP 3 s) | GREEN — entered 0.52 s after the queue read full (0.91 s after SIGSTOP), 0 exits while stopped, closed 0.5 s after drained | GREEN — 0.52 / 0.91 s, 0, 0.5 s | GREEN — 0.52 / 0.91 s, 0, 0.5 s |
+| 7 healthy burst | GREEN — 0 entered (1 drop: frame 321, startup) | GREEN — 0 entered (0 drops) | GREEN — 0 entered (1 drop) |
+| 8 behind `rate 100000` 8 s | GREEN — 1 entry, 0 exits, congested at end (2,844) | GREEN — 1, 0, congested (2,840) | GREEN — 1, 0, congested (2,845) |
+| verdict (`accept_verdict.py` rc) | 6 GREEN, 2 RED — rc=1 | **8 GREEN — rc=0** | 5 GREEN, 3 RED — rc=1 |
+
+The brief predicted (3)+(4) red on `c3c52232` and (1)+(2) red on `9120f760`;
+measured, `9120f760` is ALSO red on (4): its exit is decided only at an offer
+too, so with nobody offering its flag holds through the quiet and the burst is
+dropped. mf.8's sticky leg is green only because its exit had no gap reset.
+Logs: moc4 `~/mf10-build/out/accept_{c3,mine,91}/`.
+
+**Mutant matrix** (`mutants8.sh`, 40 mutants, every sed dry-run-checked to
+apply — `wallclock` 10 lines, `nolock` 5, the rest 1; `FAILFAST=1`, so a
+killed mutant names the FIRST failing test only; whole matrix on the final
+file, frozen snapshot `~/mf10-build/tree_final`, md5 `c896454bb88b` /
+`d978c763e5b7`): carried mf.9's 29 (`noidle`, `dropsonly` re-anchored on the
+new lines; `quietexit` and the pass's `stickyhold` were mutations of the gap
+reset that mf.10 REMOVES — on mf.9 they read as "no gap reset", which is now
+the design — so `quietexit` is re-anchored to its descendant, the coverage rule
+removed, and `stickyhold` to what makes the flag sticky now, the writer's poll
+no longer an exit observer); added the pass's `waitedonly slowpoll endspannoop
+waitfloor20 stickyhold` (`slowpoll`/`endspannoop` re-anchored) and six aimed at
+the new accounting: `pollbehind` (writer polls always read backed up),
+`offeronlyexit` (the writer credits but never closes), `gaprestart` (an
+observation gap over `TX_PUT_WAIT_S` restarts the window — the mf.9 class on
+the shared clock; a `> TX_CONGEST_FULL_S` threshold there is subsumed by the
+coverage rule and was not run), `spanonlypoll` (the poll runs only while a
+span is open — mf.9's cadence), `endspanstale` (the `observed_at` guard
+removed), `offlineobs` (the writer observes an offline child).
+
+`mutants.out` (moc4, 17:00–17:31, verbatim):
+
+```
+span0 rc=1 Ran 1 test in 0.094s FAILED (failures=1) 
+    FAIL: test_a_burst_the_writer_absorbed_ends_the_span
+never rc=1 Ran 13 tests in 16.822s FAILED (failures=1) 
+    FAIL: test_child_behind_at_a_fast_rate_still_congests
+always rc=1 Ran 19 tests in 55.248s FAILED (failures=1) 
+    FAIL: test_congestion_episode_is_logged_at_entry_and_exit
+selectpoll rc=1 Ran 14 tests in 22.307s FAILED (failures=1) 
+    FAIL: test_child_behind_faster_than_a_page_per_put_wait_still_congests
+nogap rc=1 Ran 7 tests in 3.727s FAILED (failures=1) 
+    FAIL: test_a_quiet_gap_longer_than_the_span_restarts_it
+noreset rc=1 Ran 50 tests in 130.903s FAILED (failures=1) 
+    FAIL: test_the_writer_ends_the_span_after_a_write_not_only_when_idle
+lowwater rc=1 Ran 3 tests in 1.616s FAILED (failures=1) 
+    FAIL: test_a_late_offer_does_not_book_the_gap_before_it_as_room
+countweighted rc=1 Ran 1 test in 0.539s FAILED (failures=1) 
+    FAIL: test_a_burst_the_writer_absorbed_ends_the_span
+noroom rc=1 Ran 40 tests in 134.520s FAILED (failures=1) 
+    FAIL: test_room_that_outweighs_full_in_time_abandons_the_span
+anyroom rc=1 Ran 16 tests in 40.354s FAILED (failures=1) 
+    FAIL: test_child_behind_that_reads_in_gulps_congests_once_at_the_rns_mtu
+nothrottled rc=1 Ran 4 tests in 2.137s FAILED (failures=1) 
+    FAIL: test_a_put_that_found_the_queue_full_samples_however_short_its_wait
+gapge rc=1 Ran 8 tests in 4.255s FAILED (failures=1) 
+    FAIL: test_a_sample_exactly_one_span_later_still_accrues
+roomge rc=1 Ran 38 tests in 111.779s FAILED (failures=1) 
+    FAIL: test_room_equal_to_full_keeps_the_span
+frac25 rc=1 Ran 33 tests in 115.639s FAILED (failures=1) 
+    FAIL: test_pipe_full_fraction_has_a_lower_side
+capfail rc=1 Ran 14 tests in 22.285s FAILED (failures=1) 
+    FAIL: test_child_behind_faster_than_a_page_per_put_wait_still_congests
+noclamp rc=1 Ran 9 tests in 4.800s FAILED (failures=1) 
+    FAIL: test_a_sample_from_the_past_credits_nothing
+wallclock rc=1 Ran 11 tests in 64.797s FAILED (failures=1) 
+    FAIL: test_a_wall_clock_that_stops_cannot_hide_a_stall
+rawgap rc=1 Ran 35 tests in 106.238s FAILED (failures=1) 
+    FAIL: test_quiet_between_pulses_is_not_credited_as_full
+noidle rc=1 Ran 28 tests in 104.586s FAILED (failures=1) 
+    FAIL: test_healthy_pulse_child_between_pulses_never_congests
+frac75 rc=1 Ran 14 tests in 22.278s FAILED (failures=1) 
+    FAIL: test_child_behind_faster_than_a_page_per_put_wait_still_congests
+everyoffer rc=1 Ran 21 tests in 56.269s FAILED (failures=1) 
+    FAIL: test_exit_needs_room_for_most_of_the_window
+dropsonly rc=1 Ran 3 tests in 1.597s FAILED (failures=1) 
+    FAIL: test_a_late_offer_does_not_book_the_gap_before_it_as_room
+nodropexit rc=1 Ran 2 tests in 1.065s FAILED (failures=1) 
+    FAIL: test_a_drop_restarts_the_exit_window
+nolwexit rc=1 Ran 6 tests in 3.200s FAILED (failures=1) 
+    FAIL: test_a_queue_over_low_water_restarts_the_exit_window
+quietexit rc=1 Ran 45 tests in 136.880s FAILED (failures=1) 
+    FAIL: test_sparse_offers_alone_observe_too_little_to_close_an_episode
+rawexit rc=1 Ran 3 tests in 1.598s FAILED (failures=1) 
+    FAIL: test_a_late_offer_does_not_book_the_gap_before_it_as_room
+nolock rc=1 Ran 18 tests in 48.520s FAILED (failures=1) 
+    FAIL: test_concurrent_samples_never_credit_more_than_wall_time
+capsilent rc=1 Ran 29 tests in 122.951s FAILED (failures=1) 
+    FAIL: test_import_without_fcntl_and_termios
+capquiet rc=1 Ran 53 tests in 177.542s FAILED (failures=1) 
+    FAIL: test_unreadable_pipe_capacity_is_counted_and_logged_once
+waitedonly rc=1 Ran 1 test in 0.094s FAILED (failures=1) 
+    FAIL: test_a_burst_the_writer_absorbed_ends_the_span
+slowpoll rc=1 Ran 19 tests in 55.799s FAILED (failures=1) 
+    FAIL: test_congestion_episode_is_logged_at_entry_and_exit
+endspannoop rc=1 Ran 1 test in 0.103s FAILED (failures=1) 
+    FAIL: test_a_burst_the_writer_absorbed_ends_the_span
+waitfloor20 rc=1 Ran 5 tests in 2.706s FAILED (failures=1) 
+    FAIL: test_a_put_that_waited_under_the_floor_without_a_full_queue_does_not_sample
+stickyhold rc=1 Ran 19 tests in 55.214s FAILED (failures=1) 
+    FAIL: test_congestion_episode_is_logged_at_entry_and_exit
+pollbehind rc=1 Ran 19 tests in 55.301s FAILED (failures=1) 
+    FAIL: test_congestion_episode_is_logged_at_entry_and_exit
+offeronlyexit rc=1 Ran 36 tests in 101.248s FAILED (failures=1) 
+    FAIL: test_quiet_then_burst_after_an_episode_drops_nothing
+gaprestart rc=1 Ran 2 tests in 1.065s FAILED (failures=1) 
+    FAIL: test_a_drop_restarts_the_exit_window
+spanonlypoll rc=1 Ran 19 tests in 55.267s FAILED (failures=1) 
+    FAIL: test_congestion_episode_is_logged_at_entry_and_exit
+endspanstale rc=1 Ran 10 tests in 5.342s FAILED (failures=1) 
+    FAIL: test_a_span_opened_after_the_writers_read_survives_its_clear
+offlineobs rc=1 Ran 57 tests in 147.537s FAILED (failures=1) 
+    FAIL: test_writer_polls_while_offline_do_not_close_the_episode
+DONE
+```
+
+**40 of 40 killed; accepted gaps: none.** Killed FIRST by a test added in mf.10: `quietexit` (coverage), `waitfloor20`, `offeronlyexit` (quiet-then-burst), `endspanstale`, `offlineobs`. `stickyhold`, `pollbehind` and `spanonlypoll` die first on the existing `test_congestion_episode_is_logged_at_entry_and_exit` — it stops offering for 2 s and then offers every 50 ms (each offer observes 20 ms of 50, under the half-window coverage), so its exit needs the writer's polls. Checked without FAILFAST against the principle tests alone (moc4 `~/mf10-build/out/newtests_vs/`): `stickyhold` and `pollbehind` fail (i), (iii) and (iv) (`Ran 3 … failures=3`); `spanonlypoll` fails (iii) and (iv) (`failures=2` — (i) calls the poll directly, so it cannot see the cadence).
+
+**Other of record (moc4, final tree):** stall file ×3 `Ran 57 tests … OK`
+rc=0 (143.3 s / 161.7 s / 143.4 s, each started at load < 1.0); the other 11
+`meshforge_*` files `Ran 63 … OK` rc=0; `tests.all` `Ran 36 … OK (skipped=1)`
+rc=0 (no rerun needed). Second kernel: this Pi 5 (16 KB pages) `Ran 57 … OK`
+rc=0, once. rnsd untouched (moc4 `MainPID=899829 NRestarts=0` before and after).
+
+**Not changed:** `TX_PUT_WAIT_S`, `TX_CONGEST_FULL_S`, `TX_QUEUE_DEPTH`,
+`TX_LOW_WATER`, `TX_STALL_S`, `TX_PIPE_FULL_FRACTION`, the FIONREAD signal, the
+entry rule and its credit, the throttled sampling and its floor, the
+stall/offline logic, framing, respawn (a detached interface whose child dies is
+still respawned — stock; the test fixture parks it, as in mf.9). **Not
+checked:** the rnstatus line against a live rnsd; real RNS packets on 4 KB;
+the matrix and the acceptance script on the 16 KB kernel (one stall-file run
+there); a writer GIL-starved for whole windows while congested (the coverage
+rule then HOLDS the episode — fail-safe for loss, a stale flag for rnstatus);
+the poll back-off alternative was reasoned, not built. **Owed:** a FRESH
+non-author pass on a 4 KB box before any tag — `accept.sh` is its first step,
+then the shapes this author did not think of.
+
 ### `1.3.8+mf.9` (UNRELEASED) — the congestion gate credits only time it OBSERVED, and closes an episode on what the domain loses
 
 Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2,
@@ -199,6 +474,8 @@ the quiet decide (they are offered without waiting, so a caught-up child
 costs nobody anything in that window). `rnstatus` may read "child behind,
 dropping now" through an idle period after an episode — a stale flag, not a
 loss. Stock behaviour has no flag at all.
+
+> **Contradicted by measurement (mf.10):** the flag held through sustained sparse traffic, not only idle, and the next burst into a healthy child was dropped (1,557–1,741 of 2,000, non-author pass on `c3c52232`) — see `1.3.8+mf.10` above.
 
 Tests (`tests/meshforge_pipe_interface_stall.py`, 28 → 49): 21 new. **Red-first — the
 final file run against the `9120f760` gate on moc4 (`tree9red` = this tree
