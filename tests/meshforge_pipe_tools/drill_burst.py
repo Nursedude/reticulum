@@ -15,11 +15,11 @@ patches = [mock.patch.object(RNS.Reticulum, "transport_enabled", staticmethod(la
 for p in patches: p.start()
 rec = []
 class Probe(PI.PipeInterface):
-    def _note_pipe_full(self, now):
+    def _note_pipe_full(self, now, *a):
         fd = self.process.stdin.fileno()
         w = bool(select.select([], [fd], [], 0)[1]); o = struct.unpack("i", fcntl.ioctl(fd, termios.FIONREAD, b"\0\0\0\0"))[0]
         rec.append(("note", now, self._txq.qsize(), w, o, self.tx_dropped))
-        return super()._note_pipe_full(now)
+        return super()._note_pipe_full(now, *a)   # mf.9: (now, waited)
 for run in range(3):
     iface = Probe(T.FakeOwner(), {"name": "burst", "command": f"{sys.executable} -u {child}"})
     cap = fcntl.fcntl(iface.process.stdin.fileno(), 1032)

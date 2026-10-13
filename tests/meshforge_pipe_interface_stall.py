@@ -16,6 +16,7 @@
 # coincidence (16 frames fill a 16 KB page exactly) and wrong at 500 B; a
 # shape tested at one size pins that size, not the rule.
 import fcntl
+import inspect
 import os
 import select
 import signal
@@ -43,9 +44,17 @@ CHILD = textwrap.dedent("""
     # same mean rate as "rate R" but it empties the whole pipe in one read
     # (a child that os.read()s a large buffer), fresh pass on 925d275c F1.
     gulp = float(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[1] == "gulp" else None
+    # "tick": every 0.25 s read whatever the pipe holds (up to 1 MB) — a child
+    # that keeps up on a timer, so the pipe climbs for a tick and empties at
+    # once (non-author pass on 9120f760, F4: on a 64 KB pipe at 160 kB/s each
+    # tick peaks ~39 KB, above the 32 KB line, and the episode never closed).
+    tick = sys.argv[1:2] == ["tick"]
     fd = sys.stdin.fileno()
     while True:
-        if gulp:
+        if tick:
+            time.sleep(0.25)
+            if not os.read(fd, 1 << 20): break
+        elif gulp:
             d = os.read(fd, 1 << 20)
             if not d: break
             time.sleep(len(d) / gulp)
@@ -91,6 +100,13 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         # when a fixture-only test first preceded the respawn test, which
         # counts writer threads).
         self.iface.detached = True
+        # The stock respawn loop does not look at `detached`: a killed child
+        # is respawned every respawn_delay for the rest of the run, into a
+        # tmp dir that no longer exists (~300 failed python3 starts per run on
+        # 9120f760, ~1000 with the mf.9 tests — load 4-10 on a Pi 4 by the
+        # end of the file, which the late, timing-sensitive tests then
+        # measured). Park the loop instead.
+        self.iface.respawn_delay = 3600
         try: self.iface.process.kill()
         except Exception: pass
         if getattr(self.iface, "_writer", None) is not None: self.iface._writer.join(2)
@@ -103,6 +119,7 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         change, and test_child_crash_respawn_stays_online counts them)."""
         def retire(i):
             i.detached = True
+            i.respawn_delay = 3600   # see tearDown
             try: i.process.kill()
             except Exception: pass
             if i._writer is not None: i._writer.join(2)
@@ -663,6 +680,26 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertNotEqual(entered, [], "a child that was behind never entered congested mode")
         self.assertEqual(len(entered), 1, f"congested {len(entered)}x in 10 s: the episode closed on a child still behind ({waits} waits)")
 
+    def _note(self, now, waited=None):
+        """Feed one sample to the gate with an explicit clock. `waited` is how
+        long the put that sampled waited for its slot; default: the whole
+        interval (several senders waiting back to back), so the tests that
+        pin the span arithmetic keep their arithmetic. On a tree whose gate
+        takes no `waited` (9120f760 and before) the sample is fed without it,
+        so a test written for the bound FAILS there instead of ERRORing."""
+        f = self.iface._note_pipe_full
+        if "waited" in inspect.signature(f).parameters:
+            f(now, waited=PI.PipeInterface.TX_CONGEST_FULL_S if waited is None else waited)
+        else:
+            f(now)
+
+    def _park_writer(self):
+        """Retire the writer thread so a sample sequence fed with an explicit
+        clock is not raced by the writer's own checks on a live pipe."""
+        self.iface._writer_gen += 1
+        self.iface._writer.join(2)
+        self.assertFalse(self.iface._writer.is_alive(), "writer did not park")
+
     def test_span_start_cleared_by_the_writer_mid_sample_does_not_raise(self):
         """Fresh pass on 925d275c, F2: `_note_pipe_full` read the span start
         twice — `is None`, then the subtraction — and the writer thread clears
@@ -683,8 +720,8 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.iface.__class__ = Interleave
         self.iface._pipe_full = lambda: True
         now = time.monotonic()
-        self.iface._note_pipe_full(now)
-        self.iface._note_pipe_full(now + 0.1)   # raised on 925d275c
+        self._note(now)
+        self._note(now + 0.1)   # raised on 925d275c
         self.assertEqual(fired[0], 1, "the interleave was not exercised")
         self.assertFalse(self.iface._tx_congested)
 
@@ -695,14 +732,15 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         15/15. Samples are fed with explicit clocks so the leg is pinned on
         its own: a 0.8-span-long run of full samples, a 1.6-span quiet gap,
         then 0.6 span of full samples must NOT congest; 1.1 span must."""
+        self._park_writer()
         S = PI.PipeInterface.TX_CONGEST_FULL_S
         self.iface._pipe_full = lambda: True
         t0 = time.monotonic()
-        for f in (0.0, 0.2, 0.4, 0.6, 0.8): self.iface._note_pipe_full(t0 + f * S)
+        for f in (0.0, 0.2, 0.4, 0.6, 0.8): self._note(t0 + f * S)
         self.assertFalse(self.iface._tx_congested, "congested after 0.8 of the span")
-        for f in (2.4, 2.6, 3.0): self.iface._note_pipe_full(t0 + f * S)
+        for f in (2.4, 2.6, 3.0): self._note(t0 + f * S)
         self.assertFalse(self.iface._tx_congested, "a span survived a quiet gap longer than TX_CONGEST_FULL_S")
-        self.iface._note_pipe_full(t0 + 3.5 * S)
+        self._note(t0 + 3.5 * S)
         self.assertTrue(self.iface._tx_congested, "a child behind for 1.1 spans after the gap did not congest")
 
     def test_a_burst_the_writer_absorbed_ends_the_span(self):
@@ -719,7 +757,7 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         full = [True]
         self.iface._pipe_full = lambda: full[0]
         t0 = time.monotonic()
-        for f in (0.0, 0.2, 0.4): self.iface._note_pipe_full(t0 + f * S)
+        for f in (0.0, 0.2, 0.4): self._note(t0 + f * S)
         self.assertIsNotNone(self.iface._tx_full_since)
         # the burst is absorbed: the writer's next completed write finds the
         # queue empty and the pipe writable
@@ -731,11 +769,11 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertGreater(self.iface.txb, txb0, "the writer never wrote the frame")
         time.sleep(0.05)   # the writer's post-write check runs after txb is bumped
         full[0] = True
-        self.iface._note_pipe_full(t0 + 1.1 * S)
+        self._note(t0 + 1.1 * S)
         self.assertFalse(self.iface._tx_congested, "congested on the sum of two spans separated by an absorbed burst")
-        self.iface._note_pipe_full(t0 + 1.5 * S)
+        self._note(t0 + 1.5 * S)
         self.assertFalse(self.iface._tx_congested, "the span that began at 1.1 S is only 0.4 S old")
-        self.iface._note_pipe_full(t0 + 2.2 * S)
+        self._note(t0 + 2.2 * S)
         self.assertTrue(self.iface._tx_congested, "a span 1.1 S old did not congest (the shape is vacuous)")
 
     def test_pipe_full_reads_occupancy_not_a_free_page(self):
@@ -777,18 +815,19 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         30 room samples inside 0.01 S, then full samples again. The cluster
         stood for ~0.03 S of room against 0.3 S of full, so the span survives;
         full time reaches S at 1.1 S (0.3 + 0.17 + 0.6), not at 0.9 S."""
+        self._park_writer()
         S = PI.PipeInterface.TX_CONGEST_FULL_S
         full = [True]
         self.iface._pipe_full = lambda: full[0]
         t0 = time.monotonic()
-        for f in (0.0, 0.1, 0.2, 0.3): self.iface._note_pipe_full(t0 + f * S)
+        for f in (0.0, 0.1, 0.2, 0.3): self._note(t0 + f * S)
         full[0] = False
-        for i in range(30): self.iface._note_pipe_full(t0 + 0.32 * S + i * 0.0003 * S)
+        for i in range(30): self._note(t0 + 0.32 * S + i * 0.0003 * S)
         self.assertIsNotNone(self.iface._tx_full_since, "30 room samples spanning 0.01 S abandoned a 0.3 S span of full ones")
         full[0] = True
-        for f in (0.5, 0.7, 0.9): self.iface._note_pipe_full(t0 + f * S)
+        for f in (0.5, 0.7, 0.9): self._note(t0 + f * S)
         self.assertFalse(self.iface._tx_congested, "congested before TX_CONGEST_FULL_S of full evidence (0.87 S)")
-        self.iface._note_pipe_full(t0 + 1.1 * S)
+        self._note(t0 + 1.1 * S)
         self.assertTrue(self.iface._tx_congested, "a child behind for 1.1 S with one 10 ms cluster of room samples did not congest")
 
     def test_room_that_outweighs_full_in_time_abandons_the_span(self):
@@ -801,18 +840,19 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         abandons on room has 1.0 S of full time here and congests; the span
         must have started fresh at 1.2 S and hold 0.5 S. The same fresh span
         congests at 2.3 S (1.1 S), so the shape is not vacuous."""
+        self._park_writer()
         S = PI.PipeInterface.TX_CONGEST_FULL_S
         full = [True]
         self.iface._pipe_full = lambda: full[0]
         t0 = time.monotonic()
-        for f in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5): self.iface._note_pipe_full(t0 + f * S)
+        for f in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5): self._note(t0 + f * S)
         full[0] = False
-        for f in (0.7, 0.9, 1.1): self.iface._note_pipe_full(t0 + f * S)
+        for f in (0.7, 0.9, 1.1): self._note(t0 + f * S)
         self.assertIsNone(self.iface._tx_full_since, "0.6 S of room against 0.5 S of full did not abandon the span")
         full[0] = True
-        for f in (1.2, 1.4, 1.6, 1.7): self.iface._note_pipe_full(t0 + f * S)
+        for f in (1.2, 1.4, 1.6, 1.7): self._note(t0 + f * S)
         self.assertFalse(self.iface._tx_congested, "congested with 0.5 S of full evidence in the fresh span: the abandoned span's full time was carried")
-        for f in (2.0, 2.3): self.iface._note_pipe_full(t0 + f * S)
+        for f in (2.0, 2.3): self._note(t0 + f * S)
         self.assertTrue(self.iface._tx_congested, "a fresh 1.1 S span after the abandoned one did not congest (the shape is vacuous)")
 
     def test_caught_up_needs_an_empty_queue_and_a_pipe_with_room(self):
@@ -844,7 +884,7 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         (on the real kernel the 800 kB/s shape also samples on jitter waits,
         so the `nothrottled` mutant survived the file on both kernels)."""
         noted = []
-        self.iface._note_pipe_full = lambda now: noted.append(now)
+        self.iface._note_pipe_full = lambda now, *a, **k: noted.append(now)
         class InstantFullQueue:
             def full(self): return True
             def put(self, data, timeout=None): return None
@@ -872,6 +912,398 @@ class MeshForgePipeInterfaceStallTest(unittest.TestCase):
         self.assertEqual(len(ifs), 1, stats["interfaces"])
         self.assertEqual(ifs[0].get("tx_dropped"), self.iface.tx_dropped)
         self.assertIs(ifs[0].get("tx_congested"), False)
+
+    # ---- 1.3.8+mf.9: non-author pass on 9120f760 (2026-10-12, moc4 4 KB) ----
+
+    def _offer_at(self, bps, seconds, size=1000):
+        """One sender offering `size`-B frames at `bps` for `seconds`, paced
+        to a schedule (it does not sleep once it has fallen behind it)."""
+        fs = bps / size; t0 = time.monotonic(); k = 0
+        while time.monotonic() - t0 < seconds:
+            k += 1; self.iface.process_outgoing(b"o" * size)
+            rem = t0 + k / fs - time.monotonic()
+            if rem > 0: time.sleep(rem)
+
+    def _exit_offers(self, times, backed=lambda t: False, before=lambda t: None):
+        """Feed congested-mode offers to the exit rule with an explicit clock;
+        return the first offer time at which it said caught up, or None."""
+        for t in times:
+            before(t)
+            self.iface._pipe_full = (lambda b: (lambda: b))(backed(t))
+            if self.iface._caught_up_for(t): return t
+        return None
+
+    def _congested_parked(self):
+        self._park_writer()
+        self.iface._tx_congested = True
+        self.iface._tx_clear_since = None
+        return PI.PipeInterface.TX_CONGEST_FULL_S
+
+    def test_quiet_between_pulses_is_not_credited_as_full(self):
+        """F1 (non-author pass on 9120f760), the measured sequence replayed
+        with an explicit clock: a healthy child fed 400 x 1000-B pulses every
+        0.25 s (1.6 MB/s mean into 2 MB/s). Each pulse fills the 64 KB pipe
+        for a few ms, the child empties it, and nothing waits in between. The
+        gate credited the WHOLE gap since the previous sample to the state the
+        pipe was in at the next one: full at 0.031-0.033, full again at 0.296
+        -> 0.263 s of quiet booked as full, congested at 0.544 with 0 drops,
+        then 1,204 drops (1 of 5 live runs). Credit is bounded by the time the
+        put that sampled actually WAITED: what was observed, not the gap. The
+        writer is parked here so this pins the per-put bound on its own."""
+        self._park_writer()
+        W = PI.PipeInterface.TX_PUT_WAIT_S
+        self.iface._pipe_full = lambda: True
+        t0 = 1000.0; waits = 0.0
+        for k in range(8):
+            p = t0 + 0.25 * k
+            for dt, w in ((0.031, W), (0.033, 0.002), (0.046, 0.013)):
+                self._note(p + dt, waited=w)
+                if k or dt > 0.031: waits += w
+        self.assertFalse(self.iface._tx_congested, f"a healthy pulse child congested: {self.iface._tx_full_time:.3f}s booked as full against {waits:.3f}s of observed waits")
+        self.assertLessEqual(self.iface._tx_full_time, waits + 1e-9, "full time exceeds the time puts were seen waiting: the quiet between pulses was credited")
+
+    def test_writer_idle_with_a_drained_pipe_ends_the_span(self):
+        """F1, the other half: the writer's caught-up check ran only AFTER a
+        write, so a burst's last write left the pipe over half full and the
+        quiet that followed was never looked at — `_tx_full_since` stayed set
+        over `occ=0 qsize=0` between pulses (review drill, every pulse line).
+        A writer that goes idle with a span open looks at the pipe while it
+        waits, so a pipe that drains with nothing queued ends the span without
+        any put."""
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        self._note(time.monotonic(), waited=PI.PipeInterface.TX_PUT_WAIT_S)
+        self.assertIsNotNone(self.iface._tx_full_since)
+        full[0] = False
+        # The writer may have entered its idle wait (0.5 s) before the span
+        # opened; from then on it looks every TX_PUT_WAIT_S.
+        deadline = time.monotonic() + 1.0
+        while self.iface._tx_full_since is not None and time.monotonic() < deadline: time.sleep(0.005)
+        self.assertIsNone(self.iface._tx_full_since, "an idle writer left a span open over a pipe with room and an empty queue")
+
+    def test_the_writer_ends_the_span_after_a_write_not_only_when_idle(self):
+        """The writer's post-write check, pinned apart from the new idle one:
+        a writer fed faster than its idle poll never times out, so only the
+        check after a write can see a child that took everything. The idle
+        poll is pushed out of reach (TX_PUT_WAIT_S 10 s); one frame written
+        into a pipe with room, with nothing else queued, ends the span (mf.9
+        matrix: with the idle check in place `noreset` survived the file)."""
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        with mock.patch.object(PI.PipeInterface, "TX_PUT_WAIT_S", 10.0):
+            self._note(time.monotonic(), waited=0.02)
+            self.assertIsNotNone(self.iface._tx_full_since)
+            full[0] = False
+            txb0 = self.iface.txb
+            self.iface.process_outgoing(b"a" * 500)
+            deadline = time.monotonic() + 1.0
+            while self.iface._tx_full_since is not None and time.monotonic() < deadline: time.sleep(0.005)
+            self.assertGreater(self.iface.txb, txb0, "the writer never wrote the frame")
+            self.assertIsNone(self.iface._tx_full_since, "a write that left the queue empty and the pipe with room did not end the span")
+
+    def test_healthy_pulse_child_between_pulses_never_congests(self):
+        """F1 live, the review's pulse shape: 4 senders x (pipe + ~336 kB) of
+        1000-B frames per pulse into a 2 MB/s child, the next pulse after the
+        pipe has drained. Invariants per pulse: a drained pipe with an empty
+        queue leaves NO span open (the quiet is observed, not carried), the
+        next pulse's first sample carries no more full credit than a put can
+        wait, and the child is never called behind."""
+        self._swap_iface({"name": "pulse", "command": self.cfg["command"] + " rate 2000000"})
+        self._wait_child_reading()
+        cap = fcntl.fcntl(self.iface.process.stdin.fileno(), 1032)
+        per = (cap // 1000 + 336) // 4
+        W = PI.PipeInterface.TX_PUT_WAIT_S
+        entered = self._spy_congestion()
+        sampled = [0]; first = [None]; carried = []; big = []
+        real = self.iface._note_pipe_full
+        def spy(now, *a, **k):
+            sampled[0] += 1
+            if first[0] is None:
+                first[0] = 1; open_ = self.iface._tx_full_since is not None; f0 = self.iface._tx_full_time
+                r = real(now, *a, **k)
+                if open_ and self.iface._tx_full_since is not None and self.iface._tx_full_time - f0 > 2 * W:
+                    big.append(round(self.iface._tx_full_time - f0, 3))
+                return r
+            return real(now, *a, **k)
+        self.iface._note_pipe_full = spy
+        for k in range(8):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and (self._pipe_buffered() > 0 or self.iface._txq.qsize() > 0): time.sleep(0.002)
+            time.sleep(0.1)
+            if self.iface._tx_full_since is not None: carried.append(k)
+            first[0] = None
+            ss = [threading.Thread(target=lambda: [self.iface.process_outgoing(b"p" * 1000) for _ in range(per)], daemon=True) for _ in range(4)]
+            for t in ss: t.start()
+            for t in ss: t.join(10)
+        self.assertGreater(sampled[0], 0, "no put ever waited: the pulse never filled pipe + queue and the shape is vacuous")
+        self.assertEqual(carried, [], f"pulses {carried} began with a span still open over a drained pipe and an empty queue")
+        self.assertEqual(big, [], f"a pulse's first sample credited {big} s of full time (a put waits at most {W} s)")
+        self.assertEqual(entered, [], f"a healthy pulse child was called behind ({self.iface.tx_dropped} dropped)")
+        self.assertLessEqual(self.iface.tx_dropped, 8, f"{self.iface.tx_dropped} frames dropped from 8 pulses into a healthy child")
+
+    def test_tick_child_that_keeps_up_exits_congestion(self):
+        """F4 (non-author pass on 9120f760, drill_tick.py): a child that reads
+        everything every 0.25 s, provoked behind at 1.5x what it can take,
+        then held at 0.625x — it keeps up, drops go flat, yet each tick the
+        pipe climbs past half (64 KB pipe at 160 kB/s: peaks ~39 KB vs the
+        32 KB line), ~28 of 160 offers/s landed there and reset the old
+        every-offer exit run, and the episode never closed (10 s, drops flat
+        at 175). Exit is decided on what the domain loses: no drop, the queue
+        at or under low water, and the pipe under half for most of the time,
+        across TX_CONGEST_FULL_S of offers."""
+        self._swap_iface({"name": "tick", "command": self.cfg["command"] + " tick"})
+        self._wait_child_reading()
+        per_s = fcntl.fcntl(self.iface.process.stdin.fileno(), 1032) / 0.25
+        with mock.patch.object(PI.PipeInterface, "TX_STALL_S", 3600.0):
+            self._offer_at(1.5 * per_s, 3.0)
+            self.assertTrue(self.iface.tx_congested, "the tick child was never behind; the shape is vacuous")
+            t_hold = time.monotonic(); exit_at = None; d_exit = None
+            fs = 0.625 * per_s / 1000; k = 0
+            while time.monotonic() - t_hold < 8.0 and not (exit_at is not None and time.monotonic() - t_hold > exit_at + 1.0):
+                k += 1; self.iface.process_outgoing(b"o" * 1000)
+                if exit_at is None and not self.iface.tx_congested:
+                    exit_at = time.monotonic() - t_hold; d_exit = self.iface.tx_dropped
+                rem = t_hold + k / fs - time.monotonic()
+                if rem > 0: time.sleep(rem)
+        self.assertIsNotNone(exit_at, f"a tick child keeping up at {0.625 * per_s / 1000:.0f} kB/s stayed congested for 8 s ({self.iface.tx_dropped} dropped)")
+        self.assertLessEqual(exit_at, 6.0, f"exit took {exit_at:.2f}s of the hold")
+        self.assertEqual(self.iface.tx_dropped, d_exit, f"frames dropped in the 1 s after the episode closed at {exit_at:.2f}s of the hold: the child was not caught up (loadavg {os.getloadavg()[0]:.2f})")
+
+    def test_tick_child_held_behind_stays_congested(self):
+        """The control for the tick exit: the same child held at 1.5x what it
+        can take must stay congested — one episode, no exit line."""
+        self._swap_iface({"name": "tickb", "command": self.cfg["command"] + " tick"})
+        self._wait_child_reading()
+        per_s = fcntl.fcntl(self.iface.process.stdin.fileno(), 1032) / 0.25
+        entered = self._spy_congestion()
+        with mock.patch.object(PI.PipeInterface, "TX_STALL_S", 3600.0):
+            self._offer_at(1.5 * per_s, 7.0)
+        self.assertEqual(len(entered), 1, f"a tick child held behind congested {len(entered)}x in 7 s")
+        self.assertTrue(self.iface.tx_congested, "a tick child held behind was called caught up")
+
+    def test_exit_needs_room_for_most_of_the_window(self):
+        """F4 pinned without a kernel: offers every 0.05 S, the pipe over half
+        full at one in five of them (the tick child's shape), no drop, queue
+        empty: the episode closes after one window of TX_CONGEST_FULL_S."""
+        S = self._congested_parked()
+        times = [1000.0 + i * 0.05 * S for i in range(60)]
+        at = self._exit_offers(times, backed=lambda t: round((t - 1000.0) / (0.05 * S)) % 5 == 4)
+        self.assertIsNotNone(at, "pipe under half for 80 % of 3 S of offers, no drops: never caught up")
+        self.assertGreaterEqual(at - 1000.0, S - 1e-9, "caught up before a whole window of offers")
+        self.assertLessEqual(at - 1000.0, 1.5 * S, f"caught up only at {(at - 1000.0) / S:.2f} S")
+
+    def test_exit_holds_while_the_pipe_stays_backed_up_without_drops(self):
+        """The pipe half of the exit rule: a child whose pipe is over half
+        full at 60 % of the offers is still holding a backlog (the gulp child
+        on 16 KB pages after a queue dump), drops or not."""
+        S = self._congested_parked()
+        times = [1000.0 + i * 0.05 * S for i in range(80)]
+        at = self._exit_offers(times, backed=lambda t: round((t - 1000.0) / (0.05 * S)) % 5 < 3)
+        self.assertIsNone(at, f"caught up at {at} with the pipe backed up at 60 % of the offers")
+
+    def test_a_drop_restarts_the_exit_window(self):
+        """A frame dropped is the domain's loss: the window restarts at the
+        offer that sees it, so a whole TX_CONGEST_FULL_S without one is owed."""
+        S = self._congested_parked()
+        times = [1000.0 + i * 0.05 * S for i in range(60)]
+        def drop(t):
+            if abs(t - (1000.0 + 0.4 * S)) < 1e-9: self.iface.tx_dropped += 1
+        at = self._exit_offers(times, before=drop)
+        self.assertIsNotNone(at, "never caught up after the drop")
+        self.assertGreaterEqual(at - 1000.0, 1.4 * S - 1e-9, f"caught up at {(at - 1000.0) / S:.2f} S, less than a window after the drop at 0.4 S")
+
+    def test_a_queue_over_low_water_restarts_the_exit_window(self):
+        """The queue half: an offer that finds the queue over TX_LOW_WATER is
+        not a caught-up child, however the pipe looks."""
+        S = self._congested_parked()
+        times = [1000.0 + i * 0.05 * S for i in range(60)]
+        def stuff(t):
+            q = self.iface._txq
+            if abs(t - (1000.0 + 0.4 * S)) < 1e-9:
+                for _ in range(PI.PipeInterface.TX_LOW_WATER + 1): q.put_nowait(b"q")
+            elif abs(t - (1000.0 + 0.45 * S)) < 1e-9:
+                while not q.empty(): q.get_nowait()
+        at = self._exit_offers(times, before=stuff)
+        self.assertIsNotNone(at, "never caught up after the queue drained")
+        self.assertGreaterEqual(at - 1000.0, 1.4 * S - 1e-9, f"caught up at {(at - 1000.0) / S:.2f} S with the queue over low water at 0.4 S")
+
+    def test_a_quiet_gap_between_offers_restarts_the_exit_window(self):
+        """No offers for longer than TX_CONGEST_FULL_S is unobserved time,
+        not caught-up time: the window restarts at the next offer (quiet is
+        not behind, but it is not evidence either; the flag holds until offers
+        show it)."""
+        S = self._congested_parked()
+        times = [1000.0] + [1000.0 + 1.2 * S + i * 0.05 * S for i in range(40)]
+        at = self._exit_offers(times)
+        self.assertIsNotNone(at, "never caught up after the quiet")
+        self.assertGreaterEqual(at - 1000.0, 2.2 * S - 1e-9, f"caught up at {(at - 1000.0) / S:.2f} S: the quiet gap was counted as caught up")
+
+    def test_a_late_offer_does_not_book_the_gap_before_it_as_room(self):
+        """The F1 class on the exit side: an offer observes one instant. A
+        sender descheduled for most of a window that offers just after the
+        child read must not book the whole gap as room. Offers every 0.05 S
+        see the pipe backed up for 0.6 S, then one offer 0.9 S later sees
+        room: one offer, not 0.9 S of evidence — no exit at it."""
+        S = self._congested_parked()
+        times = [1000.0 + i * 0.05 * S for i in range(13)] + [1000.0 + 1.5 * S]
+        at = self._exit_offers(times, backed=lambda t: t < 1000.0 + 0.65 * S)
+        self.assertIsNone(at, f"caught up at {at}: a single late offer outweighed 0.6 S of backed-up offers")
+
+    def test_a_sample_exactly_one_span_later_still_accrues(self):
+        """The quiet-gap boundary (review: `>`-vs-`>=` unpinned): a gap of
+        exactly TX_CONGEST_FULL_S continues the span; only a LONGER one
+        restarts it. Exact binary clock values, so the gap is exactly S."""
+        self._park_writer()
+        S = PI.PipeInterface.TX_CONGEST_FULL_S
+        self.iface._pipe_full = lambda: True
+        self._note(1000.0); self._note(1000.0 + S, waited=S)
+        self.assertTrue(self.iface._tx_congested, "a gap of exactly S restarted the span")
+
+    def test_room_equal_to_full_keeps_the_span(self):
+        """The abandon boundary: room time EQUAL to full time does not end
+        the span; only room that outweighs full does."""
+        self._park_writer()
+        full = [True]
+        self.iface._pipe_full = lambda: full[0]
+        self._note(1000.0); self._note(1000.125)
+        full[0] = False
+        self._note(1000.25)
+        self.assertIsNotNone(self.iface._tx_full_since, "room equal to full in time abandoned the span")
+
+    def test_pipe_full_fraction_has_a_lower_side(self):
+        """The 0.5 line pinned from below (review: TX_PIPE_FULL_FRACTION 0.25
+        passed all 28 on 4 KB): a pipe 35 % full is NOT backed up, 65 % is."""
+        os.kill(self.child_pid, signal.SIGSTOP)
+        fd = self.iface.process.stdin.fileno()
+        cap = fcntl.fcntl(fd, 1032)
+        os.set_blocking(fd, False)
+        try:
+            def fill_to(n):
+                while self._pipe_buffered() < n: os.write(fd, b"\0" * min(4096, n - self._pipe_buffered()))
+            fill_to(cap * 35 // 100)
+            self.assertFalse(self.iface._pipe_full(), f"a pipe {self._pipe_buffered()} of {cap} bytes full read as backed up")
+            fill_to(cap * 65 // 100)
+            self.assertTrue(self.iface._pipe_full(), f"a pipe {self._pipe_buffered()} of {cap} bytes full read as not backed up")
+        finally:
+            os.set_blocking(fd, True)
+
+    def test_a_sample_from_the_past_credits_nothing(self):
+        """Two senders take `now` before the gate serializes them, so a sample
+        can arrive with a clock older than the last one: it credits nothing,
+        and does not move the span's clock backward (review: the negative-gap
+        clamp was unpinned)."""
+        self._park_writer()
+        S = PI.PipeInterface.TX_CONGEST_FULL_S
+        self.iface._pipe_full = lambda: True
+        self._note(1000.0); self._note(1000.0 + 0.6 * S)
+        self._note(1000.0 + 0.2 * S)
+        self.assertFalse(self.iface._tx_congested)
+        self._note(1000.0 + 1.0 * S)
+        self.assertTrue(self.iface._tx_congested, f"full time {self.iface._tx_full_time / S:.2f} S after 1.0 S of full samples: a stale sample subtracted time")
+
+    def test_concurrent_samples_never_credit_more_than_wall_time(self):
+        """F5 (non-author pass on 9120f760): two senders released together
+        both read the previous sample's clock and both credited the gap from
+        it. Replayed deterministically: reading the span's clock yields the
+        GIL for 5 ms, so without serialization every sender reads the same
+        value. Full + room time must never exceed the span's wall time."""
+        self._park_writer()
+        class SlowLast(type(self.iface)):
+            @property
+            def _tx_full_last(self):
+                v = self.__dict__.get("_v", 0.0); time.sleep(0.005); return v
+            @_tx_full_last.setter
+            def _tx_full_last(self, v): self.__dict__["_v"] = v
+        self.iface.__class__ = SlowLast
+        self.iface._pipe_full = lambda: True
+        with mock.patch.object(PI.PipeInterface, "TX_CONGEST_FULL_S", 60.0):
+            nows = [time.monotonic()]; self._note(nows[0])
+            since = self.iface._tx_full_since
+            def send():
+                for _ in range(10):
+                    n = time.monotonic(); nows.append(n); self._note(n, waited=60.0)
+            ss = [threading.Thread(target=send, daemon=True) for _ in range(4)]
+            for t in ss: t.start()
+            for t in ss: t.join(10)
+            self.assertEqual(self.iface._tx_full_since, since, "the span restarted; the shape is vacuous")
+            wall = max(nows) - since
+            booked = self.iface._tx_full_time + self.iface._tx_room_time
+        self.assertLessEqual(booked, wall + 1e-6, f"{booked:.3f}s booked over a span {wall:.3f}s long")
+
+    def test_a_wall_clock_that_stops_cannot_hide_a_stall(self):
+        """The gate's durations are monotonic (RTC-less Pis; fake-hwclock and
+        NTP steps move the wall clock — hfm #6; review mutant `wallclock`
+        survived the file). With the wall clock frozen, a stopped child still
+        takes the interface offline after TX_STALL_S."""
+        with mock.patch("time.time", return_value=1.0e9):
+            os.kill(self.child_pid, signal.SIGSTOP)
+            self._fill_pipe()
+            deadline = time.monotonic() + PI.PipeInterface.TX_STALL_S + 5
+            while self.iface.online and time.monotonic() < deadline:
+                self.iface.process_outgoing(b"y" * 1000); time.sleep(0.2)
+            self.assertFalse(self.iface.online, "a frozen wall clock hid a stalled child")
+
+    def test_import_without_fcntl_and_termios(self):
+        """F2 (non-author pass on 9120f760): `import fcntl` / `import termios`
+        sat unguarded at module top and Reticulum star-imports every
+        interface, so `import RNS` failed where they do not exist (Windows).
+        Without them the gate falls back to the free-page poll, COUNTED."""
+        import subprocess, json
+        script = textwrap.dedent("""
+            import json, subprocess, sys
+            sys.modules["fcntl"] = None; sys.modules["termios"] = None
+            sys.path.insert(0, sys.argv[1])
+            import RNS
+            from RNS.Interfaces import PipeInterface as PI
+            i = PI.PipeInterface.__new__(PI.PipeInterface)
+            i.name = "nofcntl"; i._pipe_cap = None; i._pipe_cap_warned = False; i.tx_probe_errors = 0
+            i.process = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+            full = [i._pipe_full(), i._pipe_full()]
+            i.process.kill()
+            print(json.dumps({"fcntl": PI.fcntl is None, "full": full, "errors": i.tx_probe_errors}))
+        """)
+        path = os.path.join(self.tmp.name, "nofcntl.py")
+        with open(path, "w") as f: f.write(script)
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        r = subprocess.run([sys.executable, path, root], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f"import RNS without fcntl/termios failed: {r.stderr.strip().splitlines()[-1:]}")
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual(out, {"fcntl": True, "full": [False, False], "errors": 1}, out)
+
+    def test_unreadable_pipe_capacity_is_counted_and_logged_once(self):
+        """F3 (non-author pass on 9120f760): an F_GETPIPE_SZ failure cached
+        capacity 0 and fell back to the select() free-page poll — the signal
+        this arc proved wrong on 4 KB pages — with no counter and no log. The
+        fallback is counted once per child and named once at WARNING."""
+        lines = []
+        real_log = RNS.log
+        def spy(msg, level=None, *a, **k):
+            if str(self.iface) in str(msg): lines.append((str(msg), level))
+            return real_log(msg, level, *a, **k) if level is not None else real_log(msg, *a, **k)
+        self.iface._pipe_cap = None
+        real_fcntl = PI.fcntl.fcntl
+        def fail(fd, cmd, *a):
+            if cmd == PI.PipeInterface.F_GETPIPE_SZ: raise OSError(22, "Invalid argument")
+            return real_fcntl(fd, cmd, *a)
+        with mock.patch.object(PI.fcntl, "fcntl", fail), mock.patch.object(RNS, "log", spy):
+            self.iface._pipe_full(); self.iface._pipe_full()
+        self.assertEqual(self.iface.tx_probe_errors, 1, "an unreadable pipe capacity was not counted (once)")
+        warn = [l for l, lv in lines if lv == RNS.LOG_WARNING and "select" in l]
+        self.assertEqual(len(warn), 1, f"the fallback was not named once at WARNING: {lines}")
+
+    def test_interface_stats_carry_probe_errors(self):
+        """F3, the rnstatus half: the probe-error counter has a reader."""
+        fake = mock.MagicMock(is_connected_to_shared_instance=False)
+        for attr in ("announce_rate_target", "announce_rate_grace", "announce_rate_penalty",
+                     "held_announces", "ic_burst_active", "ic_burst_activated",
+                     "ic_pr_burst_active", "ic_pr_burst_activated"):
+            if not hasattr(self.iface, attr): setattr(self.iface, attr, None)
+        if not hasattr(self.iface, "mode"): self.iface.mode = RNS.Interfaces.Interface.Interface.MODE_FULL
+        self.iface.tx_probe_errors = 3
+        with mock.patch.object(RNS.Transport, "interfaces", [self.iface]):
+            stats = RNS.Reticulum.get_interface_stats(fake)
+        ifs = [i for i in stats["interfaces"] if i["short_name"] == self.iface.name]
+        self.assertEqual(ifs[0].get("tx_probe_errors"), 3)
 
 
 if __name__ == "__main__":

@@ -102,6 +102,215 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### `1.3.8+mf.9` (UNRELEASED) — the congestion gate credits only time it OBSERVED, and closes an episode on what the domain loses
+
+Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2,
+`F_GETPIPE_SZ` 65536 → the 50 % line is 32 KB) by a session that did NOT
+review mf.8; the spec is the non-author pass on `9120f760` (the mf.8
+candidate), which found it NOT tag-ready with two defects reproduced live on
+this box and five surviving mutants. This cut is still an AUTHOR's cut: it
+carries no non-author pass and is not tagged; `RNS/_version.py` is not
+bumped (it still reads mf.7 — the bump belongs to the release commit).
+
+What the pass measured (moc4, its logs under `~/mf8-review/out/drills/`):
+
+- **F1 — unobserved time credited as full (the blocker; a regression of the
+  mf.6 short-burst class).** `_note_pipe_full(now)` credited the WHOLE gap
+  since the previous sample to the state the pipe was in at the next one.
+  Pulse shape (`drill_pulse_x.py`): 4 × 100 × 1000-B frames every 0.25 s
+  into a `rate 2000000` child — healthy, 1.6 MB/s mean into 2 MB/s. Between
+  pulses the pipe read `occ=0 qsize=0` with `_tx_full_since` still set (the
+  writer's caught-up reset ran only AFTER a write, and a burst's last write
+  leaves the pipe over the line); the next pulse's first waited put booked
+  0.263 s of that quiet as full. 1 of 5 runs congested at 0.54 s with 0
+  drops before entry and 1,204 after (0–1 in the runs that did not), and
+  never exited.
+- **F4 — an episode never closed for a child that keeps up on a tick.** Exit
+  needed EVERY offer across `TX_CONGEST_FULL_S` to see the queue empty and the
+  pipe under the line. A child that reads everything every 0.25 s
+  (`drill_tick.py`), provoked at 400 kB/s then held at 160 kB/s, keeps up —
+  drops flat at 175 — while each tick peaks ~39 KB, so ~28 of 160 offers/s
+  reset the run: congested for the whole 10 s hold, no exit line. Control at
+  100 kB/s (peaks ~25 KB) exited in 1.8 s.
+- **F2** `import fcntl` / `import termios` unguarded; `Reticulum` star-imports
+  every interface, so `import RNS` failed without them (Windows).
+- **F3** an `F_GETPIPE_SZ` failure cached capacity 0 and fell back SILENTLY to
+  the `select()` free-page poll — the signal mf.8 proved wrong on 4 KB.
+- **F5** no lock between sender threads in `_note_pipe_full`: two senders
+  released together read the same previous-sample clock and both credit it.
+- **Surviving mutants on 4 KB:** `gapge`, `roomge`, `frac25`, `noclamp`,
+  `wallclock` (`capfail` was killed).
+
+What changed (`RNS/Interfaces/PipeInterface.py`; measure, don't assert —
+time the gate never saw is not evidence for either side):
+
+1. **Entry credits only observed waits (F1a).** Each sample is credited with
+   `min(gap since the previous sample, the time THIS put waited)` — to full
+   or room time as before. A put waits at most `TX_PUT_WAIT_S`, so a sample
+   can never book more than that; a sender that is back-pressured spends its
+   time waiting, so a child that is really behind still accrues full time at
+   wall-clock rate (the caller has fallen behind its schedule and stops
+   sleeping between puts). The opening sample of a span still credits 0.
+2. **The writer observes the quiet (F1b).** While a pipe-full span is open
+   the writer's idle wait is `TX_PUT_WAIT_S` instead of 0.5 s, and when it
+   times out with the queue empty it checks `_child_caught_up()` (queue empty
+   AND pipe under the line) and ends the span — not only after a write. The
+   quiet-gap abandon rule (`> TX_CONGEST_FULL_S` with no waited put) is kept.
+3. **Exit is a time-weighted window, ended outright by a loss (F4).** While
+   congested, every offer: a frame dropped since the previous offer, or the
+   queue over `TX_LOW_WATER`, ends the window (none open); a gap of more than
+   `TX_CONGEST_FULL_S` between offers restarts it at this offer (unobserved
+   time, not caught-up time); otherwise the offer is credited
+   `min(gap, TX_PUT_WAIT_S)` — an offer observes one instant — to "caught
+   up" (queue empty, pipe under the line) or not. When the window is
+   `TX_CONGEST_FULL_S` old the episode closes if caught-up time exceeds the
+   rest, else the next window starts. Same constant, same weighing as entry
+   (hfm #5). A gulp child still holding a backlog (16 KB pages, the queue dump
+   fits the emptied pipe) is over the line for most of every window and stays
+   congested; a tick child that keeps up is under it ~80 % of the time and
+   closes.
+4. **F2** fcntl/termios imported under `try/except ImportError` (`None`);
+   without them `_pipe_full` takes the counted `select()` fallback.
+5. **F3** a capacity that cannot be read increments `tx_probe_errors` (once
+   per child) and logs ONE WARNING per interface naming the `select()`
+   fallback and why it is weaker; `Reticulum.get_interface_stats` exposes
+   `tx_probe_errors` beside `tx_dropped`/`tx_congested`, and `rnstatus` prints
+   `Pipe probe: N failed read(s) of the stdin pipe state (congestion gate
+   degraded)` under `Dropped` when it is non-zero.
+6. **F5 — a lock (`_tx_gate_lock`), justified by a test.** Per-put crediting
+   bounds a collision's double credit by `TX_PUT_WAIT_S`, but does not remove
+   it, and that double credit inflates exactly the quantity that decides
+   drops. Under the lock the credits of one span sum to at most its wall
+   time — an invariant `test_concurrent_samples_never_credit_more_than_wall_
+   time` checks with the read of the span's clock made to yield the GIL. The
+   ioctl stays OUTSIDE the lock; the entry/exit transitions and the writer's
+   span clear take it. A sample that arrives with a clock older than the last
+   (taken before the lock) credits nothing and never moves the span's clock
+   backward.
+7. Class comments that still described the mf.7 "abandon when a put finds
+   the pipe writable" rule are corrected; the entry line now names the
+   quantity measured: `callers waited N s for a queue slot with its stdin
+   pipe at least 50% full`, and states the exit rule.
+
+**Exit-on-quiet decision:** with no offers the congested flag HOLDS (no
+writer-side exit). Nothing is lost while nothing is offered, and quiet is not
+evidence the child caught up; the first `TX_CONGEST_FULL_S` of offers after
+the quiet decide (they are offered without waiting, so a caught-up child
+costs nobody anything in that window). `rnstatus` may read "child behind,
+dropping now" through an idle period after an episode — a stale flag, not a
+loss. Stock behaviour has no flag at all.
+
+Tests (`tests/meshforge_pipe_interface_stall.py`, 28 → 49): 21 new. **Red-first — the
+final file run against the `9120f760` gate on moc4 (`tree9red` = this tree
+with `PipeInterface.py`/`Reticulum.py`/`rnstatus.py` from `9120f760`, gate md5
+identical to the review's tree): `Ran 48`, FAILED (failures=11), rc=1:**
+
+| test | on `9120f760` (moc4) |
+|---|---|
+| `test_quiet_between_pulses_is_not_credited_as_full` (F1a, explicit clock, the review's sequence) | `a healthy pulse child congested: 1.765s booked as full against 0.260s of observed waits` |
+| `test_writer_idle_with_a_drained_pipe_ends_the_span` (F1b) | `… is not None : an idle writer left a span open over a pipe with room and an empty queue` |
+| `test_healthy_pulse_child_between_pulses_never_congests` (F1 live, 8 pulses) | `Lists differ: [1, 3, 4, 5, 6, 7] != []` — pulses that began with a span open over a drained pipe |
+| `test_tick_child_that_keeps_up_exits_congestion` (F4 live) | `a tick child keeping up at 164 kB/s stayed congested for 8 s (156 dropped)` |
+| `test_exit_needs_room_for_most_of_the_window` (F4, explicit clock) | `pipe under half for 80 % of 3 S of offers, no drops: never caught up` |
+| `test_a_drop_restarts_the_exit_window` | `caught up at 1.00 S, less than a window after the drop at 0.4 S` |
+| `test_a_quiet_gap_between_offers_restarts_the_exit_window` | `caught up at 1.20 S: the quiet gap was counted as caught up` |
+| `test_concurrent_samples_never_credit_more_than_wall_time` (F5) | `0.210s booked over a span 0.053s long` |
+| `test_import_without_fcntl_and_termios` (F2, subprocess with the modules blocked) | `ModuleNotFoundError: import of fcntl halted` |
+| `test_unreadable_pipe_capacity_is_counted_and_logged_once` (F3) | `0 != 1 : an unreadable pipe capacity was not counted (once)` |
+| `test_interface_stats_carry_probe_errors` (F3) | `None != 3` |
+
+Ten more are PINS (they pass on `9120f760` by design; each exists to kill a
+named mutant): `test_the_writer_ends_the_span_after_a_write_not_only_when_idle`
+(`noreset` — added after round 1 of the matrix, below; the idle poll is
+patched out of reach so only the post-write check can end the span; it was
+added after the red run, so it is in the final file but not in that `Ran 48`), `test_tick_child_held_behind_stays_congested` (the live control
+for the tick exit: 1.5x what the child can take for 7 s → one episode, still
+congested), `test_exit_holds_while_the_pipe_stays_backed_up_without_drops`
+(`dropsonly`), `test_a_queue_over_low_water_restarts_the_exit_window`
+(`nolwexit`), `test_a_late_offer_does_not_book_the_gap_before_it_as_room`
+(`rawexit`), `test_a_sample_exactly_one_span_later_still_accrues` (`gapge`:
+exact binary clocks, gap == S accrues), `test_room_equal_to_full_keeps_the_
+span` (`roomge`), `test_pipe_full_fraction_has_a_lower_side` (`frac25`/`frac75`:
+a real pipe 35 % full is NOT backed up, 65 % is), `test_a_sample_from_the_past_
+credits_nothing` (`noclamp`), `test_a_wall_clock_that_stops_cannot_hide_a_stall`
+(`wallclock`: `time.time` frozen, a SIGSTOPped child still goes offline after
+`TX_STALL_S` — a test, not a clock seam). Existing explicit-clock tests now
+feed samples through `_note(now, waited)` (default: the put waited the whole
+interval, so their arithmetic is unchanged; on a tree whose gate takes no
+`waited` the sample is fed without it, so a new test FAILS there instead of
+ERRORing) and park the writer (`_park_writer`) so its new idle check cannot
+race a hand-fed sequence.
+
+**A fixture defect found on the way (test-only fix):** the stock respawn loop
+(`reconnect_pipe`) does not look at `detached`, so every test's killed child
+was respawned every `respawn_delay` for the rest of the run into a tmp dir
+that no longer existed — 251–320 `can't open file … child.py` lines per run
+in the review's own `9120f760` logs, ~840–1,030 with the new tests, load 4–10
+on the Pi 4 by the end of the file. The first full run of this cut on moc4
+FAILED `test_tick_child_that_keeps_up_exits_congestion` (`35 != 18` — drops
+in the second after exit) at load 10.7; that run is archived, not counted.
+tearDown and `_swap_iface` now park the loop (`respawn_delay = 3600`); every
+run below logs 0 such lines and finished at load < 1. Production is NOT
+changed: a detached PipeInterface whose child dies is still respawned (stock
+behaviour; not this cut's question, recorded here for the next one).
+
+**Of record (moc4, Pi 4, 4 KB pages, py3.11.2, final tree — `PipeInterface.py`
+md5 `2c25c69ed3c9…`, stall file `3d34b1aaf471…`; every run started at load
+< 1.0, rc captured to a file, logs under `~/mf8-review/out9/`):**
+
+- stall file ×3 `Ran 49 tests … OK`, rc=0 (144.5 s / 140.5 s / 150.9 s),
+  0 respawn-noise lines; `meshforge_*` (12 files) `Ran 112 … OK` rc=0;
+  `tests.all` `Ran 36 … OK (skipped=1)` rc=0 (on the 48-test file; it does
+  not include the stall file). The earlier 48-test file also passed ×3 on
+  moc4 (`out9/stall{1,2,3}`). Second kernel, not required: the manager Pi 5
+  (16 KB pages, py3.13) `Ran 49 … OK` rc=0, once.
+- **Mutant matrix** (`tests/meshforge_pipe_tools/mutants8.sh`, 29 mutants,
+  every sed applied — dry-run checked before the run): round 1 on the
+  48-test file, **28 of 29 killed; `noreset` SURVIVED** (the new idle check
+  also ends the span after an absorbed burst, so the existing pin no longer
+  isolated the post-write check). Pin added; round 2 on the final 49-test
+  file: `noreset rc=1 … FAILED (failures=1)` — killed by
+  `test_the_writer_ends_the_span_after_a_write_not_only_when_idle`. **29 of
+  29 killed; accepted gaps: none** (`wallclock` is killed by the frozen-clock
+  stall test, so no clock seam was added). Only the survivor was re-run on
+  the final file — adding a test cannot revive a killed mutant, the other 28
+  tests were unchanged — but the whole matrix was NOT re-run on it. Killed by
+  ONE test each (the next pass should know where the matrix is thin):
+  `nogap`, `noroom`, `nothrottled`, `gapge`, `roomge`, `wallclock`, `rawgap`,
+  `nodropexit`, `nolwexit`, `quietexit`, `rawexit`, `nolock`, `capquiet`,
+  `noreset`.
+- **The review's drills, re-run against this tree (the external witness —
+  tests this session did not write; `drill_pulse_x.py`'s spy adapted to the
+  gate's new `(now, waited)` signature, nothing else):** pulse (`LOG=1`,
+  20 pulses, 400 × 1000 B every 0.25 s into 2 MB/s) **0 of 10 entered**,
+  drops per run 0,0,0,2,0,0,0,0,2,2; then an INTERLEAVED A/B, `9120f760`
+  (A) vs this tree (B), 10 pairs: **A entered 1 of 10** (A10 at 4.01 s,
+  339 dropped, still congested at the end — F1 reproduced), **B 0 of 10**;
+  drops in the runs that did not enter A 1,2,0,2,0,2,0,0,0 / B
+  0,0,1,1,0,0,2,0,2,0. So: B 0 of 20 entered. The brief's "≤ 1 drop per
+  run" is NOT met — 5 of 20 B runs dropped 2 — but the un-entered baseline
+  drops the same (3 of 9 A runs at 2): those are back-pressure timeouts
+  outside congested mode (a put that waited `TX_PUT_WAIT_S` for a slot; the
+  gate decides nothing there), not the gate. Per-pulse state lines show no
+  span open over `occ=0 qsize=0` (0 of 200 pre-pulse lines, 10 runs). Tick
+  (`drill_tick.py`, provoke 400 kB/s 3 s, hold 10 s): **160 kB/s — entered
+  at 0.51 s of observed waits, closed ~3 s into the hold** (`caught up; 150
+  frame(s) dropped during the episode, 175 total`) once the provoked backlog
+  had drained (offers ≥ 50 %: 158, 160, 112, then 28 per second), drops flat
+  at 175 for the remaining 6 s; control 100 kB/s closed ~1.8 s into the hold
+  (as on `9120f760`), drops flat at 175.
+
+**Not changed:** `TX_PUT_WAIT_S`, `TX_CONGEST_FULL_S`, `TX_QUEUE_DEPTH`,
+`TX_LOW_WATER`, `TX_STALL_S`, `TX_PIPE_FULL_FRACTION` (0.5), the FIONREAD
+byte signal, the throttled sampling, the stall/offline logic, framing,
+respawn. **Not checked:** the rnstatus `Pipe probe` line was not rendered
+against a live rnsd (no RNS instance was started; `get_interface_stats` is
+tested); Windows itself (the import test blocks the modules on Linux); a
+child that hovers exactly at rate with a standing backlog over half the pipe
+stays congested at zero drops (flag only — offers do not wait); real packets
+on 4 KB; the 16 KB kernel beyond one stall-file run (no matrix, no drills there). **Owed:** a FRESH non-author pass on a
+4 KB box before any tag, with the pulse drill ×≥10.
+
 ### `1.3.8+mf.8` (UNRELEASED) — the PipeInterface congestion gate reads the pipe in bytes, not pages, and weighs its evidence by time, not by sample count
 
 Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2),

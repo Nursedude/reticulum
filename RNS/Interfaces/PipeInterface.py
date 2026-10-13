@@ -39,9 +39,16 @@ import subprocess
 import shlex
 import queue
 import select
-import fcntl
 import struct
-import termios
+# Unix-only: the gate's byte count needs them. `Reticulum` star-imports every
+# interface, so an unguarded import here broke `import RNS` where they do not
+# exist (non-author pass on 9120f760, F2); without them the gate keeps the
+# free-page poll and counts it (see _pipe_full).
+try:
+    import fcntl
+    import termios
+except ImportError:
+    fcntl = termios = None
 
 class HDLC():
     # The Pipe Interface packetizes data using
@@ -85,9 +92,10 @@ class PipeInterface(Interface):
     # interface ran 8 s median / 20 s worst). Once puts have waited with
     # the pipe full for TX_CONGEST_FULL_S the interface is congested: frames
     # are offered without waiting (dropped only if the queue is full) until
-    # the child has caught up: queue EMPTY and pipe writable (_child_caught_up)
-    # across TX_CONGEST_FULL_S of offers — exit needs persistent evidence, as
-    # entry does. One caught-up sample was true with the child 1.3 s behind
+    # the child has caught up across a window of TX_CONGEST_FULL_S of offers
+    # (1.3.8+mf.9: no drop, queue at or under TX_LOW_WATER, pipe under the
+    # line for most of the window — see _caught_up_for) — exit needs
+    # persistent evidence, as entry does. One caught-up sample was true with the child 1.3 s behind
     # whenever the queue dump fit in the emptied pipe: 502-B frames pack 32
     # to a 16 KB page, so 256 frames fill 8 of 16 pages and select() reads
     # writable, and the gate re-armed every ~1.3 s (fresh pass on b18aae01,
@@ -128,11 +136,15 @@ class PipeInterface(Interface):
     # timeouts never opened a span and the caller paid a wait per frame as on
     # mf.6 (fresh pass on b18aae01, F2: 0 episodes, reader duty 0.917). A
     # healthy child whose writer is merely slow leaves the pipe writable at
-    # those samples, which abandons the span. A span is abandoned when a put
-    # finds the pipe writable, when the writer finds the child caught up
-    # (queue empty AND pipe writable — the burst was absorbed; "queue at low
-    # water" was not that, see _child_caught_up), or when no put has waited
-    # or timed out for TX_CONGEST_FULL_S (the caller was being served).
+    # those samples, which abandons the span. (mf.7 abandoned on any put
+    # that found the pipe writable; since mf.8 the rule is time-weighted and
+    # since mf.9 credits only observed waits — see the block below.) A span
+    # is abandoned when the time the pipe had room outweighs the time it was
+    # backed up, when the writer finds the child caught up (queue empty AND
+    # pipe under the line — after a write, or while idle with a span open;
+    # "queue at low water" was not that, see _child_caught_up), or when no
+    # put has waited or timed out for TX_CONGEST_FULL_S (the caller was being
+    # served).
     TX_CONGEST_FULL_S = 0.5
     # 1.3.8+mf.8 (2026-10-12): everything above was built and reviewed on the
     # two Pi 5s (16 KB pages, 256 KB pipe). Seven of the fleet's nine RNS
@@ -161,6 +173,21 @@ class PipeInterface(Interface):
     # A third 4 KB finding was the TEST: a 2000-frame burst into a child that
     # has not reached its first read yet drops frame 321 = 64 + 256 + 1 after
     # TX_PUT_WAIT_S, deterministically; startup latency, not the gate.
+    # 1.3.8+mf.9 (2026-10-12, non-author pass on the mf.8 candidate, moc4):
+    # (1) mf.8 credited each sample with the WHOLE gap since the previous one,
+    #     so the quiet between a healthy child's pulses — pipe empty, nothing
+    #     waiting, nothing observed — was booked as full time at the next
+    #     pulse's first waited put (0.263 s), and the child congested at
+    #     0.54 s with 0 drops, then dropped 1,204 frames (1 of 5 runs). Full
+    #     and room time are now credited only with time a put was SEEN
+    #     waiting (min of the gap and that put's wait), and the writer looks
+    #     at the pipe while idle with a span open, so the quiet is observed.
+    # (2) exit required every offer across the window to see the pipe under
+    #     the line; a child that keeps up on a timer peaks above it every tick
+    #     and the episode never closed. Exit now weighs the window in time,
+    #     as entry does (each offer standing for at most TX_PUT_WAIT_S), and
+    #     ends it outright on what the domain loses: a dropped frame or a
+    #     queue over low water (_caught_up_for).
     TX_PIPE_FULL_FRACTION = 0.5
     F_GETPIPE_SZ = getattr(fcntl, "F_GETPIPE_SZ", 1032)
 
@@ -203,8 +230,16 @@ class PipeInterface(Interface):
         self._tx_full_time = 0.0
         self._tx_room_time = 0.0
         self._tx_clear_since = None
+        self._tx_clear_room = 0.0
+        self._tx_clear_full = 0.0
+        self._tx_offer_last = 0.0
+        self._tx_offer_dropped = 0
         self._tx_episode_dropped = 0
+        # Serializes the gate's accounting between sender threads and the
+        # writer (non-author pass on 9120f760, F5): see _note_pipe_full.
+        self._tx_gate_lock = threading.Lock()
         self._pipe_cap = None
+        self._pipe_cap_warned = False
         self._writer_gen = 0
         self._writer = None
 
@@ -271,10 +306,10 @@ class PipeInterface(Interface):
         if self.online:
             data = bytes([HDLC.FLAG])+HDLC.escape(data)+bytes([HDLC.FLAG])
             if self._tx_congested and self._caught_up_for(time.monotonic()):
-                self._tx_congested = False
-                self._tx_full_since = None
-                self._tx_clear_since = None
-                RNS.log(f"{self} subprocess has caught up; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
+                self._end_episode()
+            # One clock read before the put: the sample below is credited
+            # with the time THIS put waited, never more (see _note_pipe_full).
+            t = time.monotonic()
             try:
                 if self._tx_congested: self._txq.put_nowait(data)
                 else:
@@ -284,16 +319,16 @@ class PipeInterface(Interface):
                     # wait is under TX_PUT_WAIT_S / 2 and a wait-length rule
                     # alone never sampled (4 KB canary, 2026-10-12).
                     throttled = self._txq.full()
-                    t = time.monotonic()
                     self._txq.put(data, timeout=PipeInterface.TX_PUT_WAIT_S)
                     now = time.monotonic()
                     # Waited for the slot and got it: the same evidence as a
                     # timed-out put if the pipe is backed up (see TX_CONGEST_FULL_S).
-                    if throttled or now - t >= PipeInterface.TX_PUT_WAIT_S / 2: self._note_pipe_full(now)
+                    if throttled or now - t >= PipeInterface.TX_PUT_WAIT_S / 2: self._note_pipe_full(now, now - t)
             except queue.Full:
-                # The queue is not empty: whatever caught-up run was open is over.
-                self._tx_clear_since = None
-                self._note_pipe_full(time.monotonic())
+                # A drop. While congested the exit rule sees it at the next
+                # offer (tx_dropped moved) and restarts its window.
+                now = time.monotonic()
+                self._note_pipe_full(now, now - t)
                 self.tx_dropped += 1
                 self._check_tx_stall()
         else:
@@ -312,59 +347,121 @@ class PipeInterface(Interface):
         # 6adfa33b, F3: tx_dropped had no reader at all).
         return self._tx_congested
 
-    def _note_pipe_full(self, now):
-        # Called on a put that waited or timed out. One backed-up sample is
-        # not evidence the child is behind (see TX_CONGEST_FULL_S); a span of
-        # them is. Each sample stands for the time since the previous one,
-        # credited to whatever the kernel says NOW: samples cluster in the
-        # milliseconds the writer frees slots, so counting them would weigh
-        # the pipe's emptiest instants 10x (4 KB canary, 2026-10-12).
+    def _note_pipe_full(self, now, waited):
+        # Called on a put that waited or timed out, with the time it WAITED.
+        # One backed-up sample is not evidence the child is behind (see
+        # TX_CONGEST_FULL_S); a span of them is. Evidence is weighed by time,
+        # not by sample count (samples cluster in the ms the writer frees
+        # slots, 4 KB canary 2026-10-12) — and only by time that was OBSERVED:
+        # each sample is credited with the gap since the previous one, but
+        # never more than its own put waited. 9120f760 credited the whole gap
+        # to the state the pipe was in NOW, so a healthy pulse child's quiet
+        # between pulses (pipe empty, nothing waiting) was booked as full:
+        # 0.263 s of it at the first waited put of the next pulse, congested
+        # at 0.54 s with 0 drops, then 1,204 (non-author pass, F1, moc4).
+        # A sender is a thread the gap is real for only while it waits.
         backed_up = self._pipe_full()
-        # One read each: the writer thread clears _tx_full_since without a
-        # lock, and a clear between a second read and the subtraction raised
-        # TypeError on the TX path (fresh pass on 925d275c, F2).
-        since = self._tx_full_since
-        last = self._tx_full_last
-        if since is None or now - last > PipeInterface.TX_CONGEST_FULL_S:
-            # No span open, or no put waited for a whole span (the caller was
-            # being served): a backed-up sample starts one, a room sample does not.
-            if not backed_up:
+        # Serialized (F5): two senders released together both read the
+        # previous sample's clock and both credited the gap from it. Under the
+        # lock the credits sum to at most the span's wall time. `since` is
+        # still read once: the writer clears it (fresh pass on 925d275c, F2).
+        with self._tx_gate_lock:
+            since = self._tx_full_since
+            last = self._tx_full_last
+            if since is None or now - last > PipeInterface.TX_CONGEST_FULL_S:
+                # No span open, or no put waited for a whole span (the caller was
+                # being served): a backed-up sample starts one, a room sample does not.
+                if not backed_up:
+                    self._tx_full_since = None
+                    return
+                self._tx_full_time = 0.0
+                self._tx_room_time = 0.0
+                self._tx_full_since = now
+                self._tx_full_last = now
+                return
+            # A sender that took its clock before another's sample landed
+            # arrives with an older `now`: it credits nothing, and the span's
+            # clock never moves backward.
+            gap = now - last if now > last else 0.0
+            credit = min(gap, waited)
+            if backed_up: self._tx_full_time += credit
+            else: self._tx_room_time += credit
+            if now > last: self._tx_full_last = now
+            if self._tx_room_time > self._tx_full_time:
+                # The pipe had room for longer than it was backed up: the writer,
+                # not the child, is what the caller has been waiting on.
                 self._tx_full_since = None
                 return
-            self._tx_full_time = 0.0
-            self._tx_room_time = 0.0
-            self._tx_full_since = now
-            self._tx_full_last = now
-            return
-        gap = now - last if now > last else 0.0
-        if backed_up: self._tx_full_time += gap
-        else: self._tx_room_time += gap
-        self._tx_full_last = now
-        if self._tx_room_time > self._tx_full_time:
-            # The pipe had room for longer than it was backed up: the writer,
-            # not the child, is what the caller has been waiting on.
+            full_for = self._tx_full_time
+            if full_for >= PipeInterface.TX_CONGEST_FULL_S and not self._tx_congested:
+                self._tx_congested = True
+                self._tx_clear_since = None
+                self._tx_episode_dropped = self.tx_dropped
+                self._tx_offer_dropped = self.tx_dropped
+                RNS.log(f"{self} subprocess is behind (callers waited {full_for:.2f}s for a queue slot with its stdin pipe at least {PipeInterface.TX_PIPE_FULL_FRACTION:.0%} full); offering without waiting and dropping what the queue cannot hold until {PipeInterface.TX_CONGEST_FULL_S:.1f}s of offers pass with no drop, the queue at or under {PipeInterface.TX_LOW_WATER} and the pipe under {PipeInterface.TX_PIPE_FULL_FRACTION:.0%} for most of that time", RNS.LOG_WARNING)
+
+    def _end_span(self):
+        with self._tx_gate_lock:
             self._tx_full_since = None
-            return
-        full_for = self._tx_full_time
-        if full_for >= PipeInterface.TX_CONGEST_FULL_S and not self._tx_congested:
-            self._tx_congested = True
+
+    def _end_episode(self):
+        with self._tx_gate_lock:
+            if not self._tx_congested: return
+            self._tx_congested = False
+            self._tx_full_since = None
             self._tx_clear_since = None
-            self._tx_episode_dropped = self.tx_dropped
-            RNS.log(f"{self} subprocess is behind (stdin pipe full for {full_for:.2f}s); offering without waiting and dropping what the queue cannot hold until the queue has stayed empty and the pipe has had room for {PipeInterface.TX_CONGEST_FULL_S:.1f}s", RNS.LOG_WARNING)
+            RNS.log(f"{self} subprocess has caught up; {self.tx_dropped - self._tx_episode_dropped} frame(s) dropped during the episode, {self.tx_dropped} total", RNS.LOG_WARNING)
 
     def _caught_up_for(self, now):
-        # Called by the caller (the only thread that knows whether a put
-        # timed out) on every offer while congested: True once the child has
-        # been caught up across TX_CONGEST_FULL_S of consecutive offers. Any
-        # sample that is not caught up, or a put that finds the queue full,
-        # restarts the run. One constant for entry and exit (hfm #5).
-        if not self._child_caught_up():
-            self._tx_clear_since = None
+        # Called on every offer while congested: True once a window of at
+        # least TX_CONGEST_FULL_S of offers has passed with no frame dropped,
+        # the queue at or under TX_LOW_WATER at every offer, and the child
+        # caught up (queue empty, pipe under the line) for MORE of that time
+        # than not — the same weighing, and the same constant, as entry (hfm
+        # #5). 9120f760 required EVERY offer in the window to be caught up: a
+        # child that keeps up on a timer (reads all of it every 0.25 s) leaves
+        # ~39 KB in a 64 KB pipe at the end of each tick at 160 kB/s, ~28 of
+        # 160 offers/s landed above the 32 KB line, and the episode never
+        # closed — 10 s, drops flat at 175 (non-author pass, F4, moc4). What
+        # the domain loses is frames: a drop or a queue over low water ends
+        # the window outright; a pipe that is over the line for most of a
+        # window is a child still holding a backlog (a gulp child after the
+        # queue dump on 16 KB pages), and that window is simply not enough
+        # evidence — the next one starts. A gap of more than
+        # TX_CONGEST_FULL_S between offers is unobserved time, not caught-up
+        # time: the window restarts at the offer after it. With no offers the
+        # flag holds; nothing is lost while nothing is offered.
+        caught_up = self._child_caught_up()
+        with self._tx_gate_lock:
+            last_offer = self._tx_offer_last
+            self._tx_offer_last = now
+            dropped = self.tx_dropped != self._tx_offer_dropped
+            self._tx_offer_dropped = self.tx_dropped
+            if dropped or self._txq.qsize() > PipeInterface.TX_LOW_WATER:
+                self._tx_clear_since = None
+                return False
+            since = self._tx_clear_since
+            if since is None or now - last_offer > PipeInterface.TX_CONGEST_FULL_S:
+                self._tx_clear_since = now
+                self._tx_clear_room = self._tx_clear_full = 0.0
+                return False
+            gap = now - last_offer if now > last_offer else 0.0
+            # An offer observes one instant: it stands for at most one put
+            # wait of the time around it, never for the whole gap since the
+            # last offer — a sender descheduled for 0.4 s that offers just
+            # after the child read would otherwise book 0.4 s of room it never
+            # saw (the F1 class, on the exit side).
+            credit = min(gap, PipeInterface.TX_PUT_WAIT_S)
+            if caught_up: self._tx_clear_room += credit
+            else: self._tx_clear_full += credit
+            if now - since < PipeInterface.TX_CONGEST_FULL_S:
+                return False
+            if self._tx_clear_room > self._tx_clear_full:
+                return True
+            # A window that was backed up for most of its time: the next one.
+            self._tx_clear_since = now
+            self._tx_clear_room = self._tx_clear_full = 0.0
             return False
-        since = self._tx_clear_since
-        if since is None:
-            self._tx_clear_since = since = now
-        return now - since >= PipeInterface.TX_CONGEST_FULL_S
 
     def _child_caught_up(self):
         # Caught up means NOTHING is backed up: the queue is empty AND the
@@ -396,9 +493,17 @@ class PipeInterface(Interface):
             cap = self._pipe_cap
             if cap is None:
                 try:
+                    if fcntl is None: raise OSError("fcntl/termios are not available on this platform")
                     cap = fcntl.fcntl(fd, PipeInterface.F_GETPIPE_SZ)
-                except OSError:
+                except OSError as e:
+                    # Counted and named (non-author pass on 9120f760, F3): the
+                    # fallback is the signal this arc measured WRONG on 4 KB
+                    # pages, so it must never be silent.
                     cap = 0
+                    self.tx_probe_errors += 1   # capacity unreadable
+                    if not self._pipe_cap_warned:
+                        self._pipe_cap_warned = True
+                        RNS.log(f"{self} cannot read its stdin pipe capacity ({e}); the congestion gate falls back to a select() free-page poll, which reads a pipe on 4 KB pages writable while it is backed up", RNS.LOG_WARNING)
                 self._pipe_cap = cap
             if cap <= 0:
                 return not select.select([], [fd], [], 0)[1]
@@ -423,8 +528,16 @@ class PipeInterface(Interface):
     def _write_loop(self, gen, process):
         while gen == self._writer_gen and not self.detached:
             try:
-                data = self._txq.get(timeout=0.5)
+                # While a pipe-full span is open the writer looks at the pipe
+                # whenever it is idle, so the quiet after a burst is OBSERVED:
+                # the caught-up check after a write sees the pipe the burst's
+                # last write left over the line, and nothing re-checked it
+                # (non-author pass on 9120f760, F1: `occ=0 qsize=0` between
+                # pulses with the span still open).
+                data = self._txq.get(timeout=PipeInterface.TX_PUT_WAIT_S if self._tx_full_since is not None else 0.5)
             except queue.Empty:
+                if self._tx_full_since is not None:
+                    if self._child_caught_up(): self._end_span()
                 continue
             if gen != self._writer_gen or self.detached:
                 # Retired while waiting: hand the frame back for the live
@@ -445,7 +558,7 @@ class PipeInterface(Interface):
             # The burst was absorbed: a pipe-full span that began before it
             # does not carry into the next one.
             if self._tx_full_since is not None and self._child_caught_up():
-                self._tx_full_since = None
+                self._end_span()
             if written != len(data):
                 RNS.log("Pipe interface only wrote "+str(written)+" bytes of "+str(len(data)), RNS.LOG_ERROR)
             if (self._tx_stalled and gen == self._writer_gen and self.pipe_is_open and not self.detached

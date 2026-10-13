@@ -1490,6 +1490,7 @@ class Reticulum:
                 # these, the band's designed drops were invisible outside the log.
                 if hasattr(interface, "tx_dropped"):           ifstats["tx_dropped"] = interface.tx_dropped
                 if hasattr(interface, "tx_congested"):         ifstats["tx_congested"] = bool(interface.tx_congested)
+                if hasattr(interface, "tx_probe_errors"):      ifstats["tx_probe_errors"] = interface.tx_probe_errors
 
                 if hasattr(interface, "r_airtime_short"):      ifstats["airtime_short"] = interface.r_airtime_short
                 if hasattr(interface, "r_airtime_long"):       ifstats["airtime_long"] = interface.r_airtime_long
