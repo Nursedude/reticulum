@@ -142,6 +142,20 @@ the private `_listener._socket` is missing (that fallback is the old leak,
 no worse). Local
 socket handling only; no wire or crypto change.
 
+Round 2 (`code-review medium`, invoked from the session, one forked
+agent, 8 findings): the release now runs BEFORE `detach_interfaces()` on
+both paths (`exit_handler` and the signal `__deferred_shutdown`). Released
+after detach, the RPC name sat bound alone for the rest of detach. The
+new assertion "rpc name already gone when detach begins" was red on the
+round-1 tree. The fallback witness is LOG_WARNING, because DEBUG is
+invisible at default levels. Test hardening: the rpc-thread check can no
+longer pass vacuously, and the TCP twin holds both sockets while picking
+ports and asserts the rpc thread exits. NOT done, by choice:
+close-before-accept fd reuse (vanishing window: a closed fd raises and the
+loop sees `None`); an accepted `conn` not closed when its handler raises
+(upstream behaviour, an offer-back candidate); `meshforge_*` tests outside
+`tests/all.py` (true of every fork test, run by hand at release).
+
 Fleet exposure is narrow: `RNS.exit()` ends in `os._exit()`, and systemd
 restarts rnsd only after the old process is gone. The window is a process
 that host-fell-back (#69) and is shutting down slowly while rnsd starts.

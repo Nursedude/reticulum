@@ -44,12 +44,27 @@ class MeshForgeRpcReleaseTest(unittest.TestCase):
         self.assertIn(f"@rns/{name}/rpc", _abstract_names(f"@rns/{name}"))
         rpc_threads = [t for t in threading.enumerate()
                        if getattr(t, "_target", None) == r.rpc_loop]
+        self.assertTrue(rpc_threads, "rpc_loop thread not found — the exit check below would be vacuous")
+
+        # The RPC name must already be gone when detach starts freeing the
+        # shared-instance name: released AFTER it, a new host binding the freed
+        # name in that gap still dies on EADDRINUSE (code-review medium, F1).
+        seen_at_detach = []
+        real_detach = RNS.Transport.detach_interfaces
+        def recording_detach():
+            seen_at_detach.append(_abstract_names(f"@rns/{name}"))
+            return real_detach()
+        RNS.Transport.detach_interfaces = staticmethod(recording_detach)
+        self.addCleanup(setattr, RNS.Transport, "detach_interfaces", staticmethod(real_detach))
 
         out, err = sys.stdout, sys.stderr          # exit_handler detaches stdio
         try:
             RNS.Reticulum.exit_handler()
         finally:
             sys.stdout, sys.stderr = out, err
+        self.assertTrue(seen_at_detach, "detach_interfaces was not called")
+        self.assertNotIn(f"@rns/{name}/rpc", seen_at_detach[0],
+                         "RPC name still bound when detach began freeing the shared name")
 
         # The rpc thread may sit in accept(); give the release a moment, but
         # never pass on a name that is still bound.

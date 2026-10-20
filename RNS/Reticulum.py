@@ -196,8 +196,10 @@ class Reticulum:
         # out cleanup operations.
         if not Reticulum.__exit_handler_ran:
             Reticulum.__exit_handler_ran = True
-            if not Reticulum.__interface_detach_ran: RNS.Transport.detach_interfaces()
+            # RPC first: released after detach, its name was left bound alone
+            # in the gap after the shared-instance name was freed.
             Reticulum.__release_rpc_listener()
+            if not Reticulum.__interface_detach_ran: RNS.Transport.detach_interfaces()
             RNS.Transport.exit_handler()
             RNS.Identity.exit_handler()
 
@@ -208,6 +210,8 @@ class Reticulum:
 
     @staticmethod
     def __release_rpc_listener():
+        # Idempotent (rpc_listener is None after the first call), so both the
+        # signal path and exit_handler may call it.
         # MeshForge fork: upstream never closed rpc_listener, so a process
         # that outlived its teardown kept @rns/<instance>/rpc bound after
         # detach released @rns/<instance> (mf.3). A new host then bound the
@@ -223,7 +227,7 @@ class Reticulum:
         except Exception as e:
             # Without the shutdown a blocked accept() keeps the name bound
             # (the pre-fix leak); leave a witness instead of a silent fallback.
-            RNS.log(f"Could not shut down RPC listener socket, its name may stay bound: {e}", RNS.LOG_DEBUG)
+            RNS.log(f"Could not shut down RPC listener socket, its name may stay bound: {e}", RNS.LOG_WARNING)
         try: listener.close()
         except Exception as e: RNS.log(f"Could not close RPC listener: {e}", RNS.LOG_ERROR)
 
@@ -235,6 +239,7 @@ class Reticulum:
         # interrupted log(), and releases logging_lock, after which
         # detach_interfaces()'s own worker can acquire it. RNS.exit() then
         # reaches os._exit() to terminate the process.
+        Reticulum.__release_rpc_listener()
         RNS.Transport.detach_interfaces()
         Reticulum.__interface_detach_ran = True
         RNS.exit()
