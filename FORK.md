@@ -114,7 +114,9 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
-### UNRELEASED (rides the next tag) — teardown releases `@rns/<instance>/rpc` too
+### RELEASED as `1.3.8+mf.11` (2026-10-20, tag `29c72f38`, CUT FROM `mf.5` — see below) — teardown releases `@rns/<instance>/rpc` too
+
+**mf.11 is a side release:** `1.3.8+mf.5` + this fix only (its code+test diff), so the fleet can take it without the paused PipeInterface arc. It does NOT contain mf.6–mf.10. This branch still carries both; the next tag from here must be numbered AFTER mf.11 and must say it now includes the mf.6–10 arc. Verified on the mf.11 tree: 13 `meshforge_*` files rc=0, `tests.all` Ran 36 OK (skipped=1).
 
 Upstream never closed `rpc_listener`. Since mf.3, detach releases the
 shared-instance name `@rns/<instance>`, so a process that OUTLIVES its
