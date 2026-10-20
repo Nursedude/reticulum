@@ -102,6 +102,40 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### `1.3.8+mf.11` (2026-10-20) — teardown releases `@rns/<instance>/rpc` too. ⚠️ CUT FROM `mf.5`, NOT from mf.10
+
+**Read this before comparing version numbers.** `mf.11` is `1.3.8+mf.5`
+plus ONE fix, and nothing else. It does **not** contain `mf.6`–`mf.10`, the
+PipeInterface congestion arc: mf.6/mf.7 were tagged but never rolled, mf.7
+measured RED on 4 KB-page kernels, and mf.8–mf.10 are untagged and paused.
+The fix was cut from `mf.5`, the fleet pin, so the fleet takes this one change
+without shipping that arc. "`mf.11` > `mf.7`" does NOT mean it carries mf.7.
+Read the pinned source, never the version string.
+
+Upstream never closed `rpc_listener`, and since mf.3 detach frees the
+shared-instance name. So a process that outlived its teardown kept
+`@rns/<n>/rpc` bound on its own. A new host then bound `@rns/<n>`, became
+the shared instance, and died in `__init__` building its RPC `Listener` with
+`OSError [Errno 98]`. Measured on the fleet's mf.5, as two processes with a
+random instance name: rc=3 → rc=0 with this fix.
+
+Cure: `__release_rpc_listener()` runs BEFORE `detach_interfaces()` on both
+paths (`exit_handler` and the signal `__deferred_shutdown`). It calls
+`shutdown()` and then `close()`: shutdown wakes the blocked `accept()`,
+whose in-flight syscall would otherwise keep the name bound past `close()`.
+`rpc_loop` exits once the listener is gone. If the private
+`_listener._socket` is missing, it logs a LOG_WARNING. Tests:
+`tests/meshforge_rpc_release.py` (AF_UNIX; asserts the RPC name is already
+gone when detach begins, and that the rpc thread exits) and
+`tests/meshforge_rpc_release_tcp.py` (TCP control port). Both are red on the
+unpatched tree. Reviews: a hand-prompted subagent (SHIP-WITH-NOTES) and
+`code-review medium` (8 findings, folded in). Local socket handling only; no
+wire or crypto change.
+
+Source: on the `meshforge` branch, commits `7672ff60` + `f4557272` +
+`2eb170c9`, applied as their code+test diff onto `1.3.8+mf.5`. On this tree:
+all 13 `meshforge_*` files rc=0, and `tests.all` ran 36, OK (skipped=1).
+
 ### `1.3.8+mf.5` (2026-10-10) — an external interface that panics while loading costs that interface, not rnsd
 
 Upstream wraps the exec + constructor of a user-supplied `interfaces/*.py`
