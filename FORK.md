@@ -114,6 +114,33 @@ upgraded together (coordinated per-box, never rapid-cycle).
 
 ## MeshForge patch history on the `1.3.8` base
 
+### UNRELEASED (rides the next tag) — teardown releases `@rns/<instance>/rpc` too
+
+Upstream never closed `rpc_listener`. Since mf.3, detach releases the
+shared-instance name `@rns/<instance>`, so a process that OUTLIVES its
+teardown (`Reticulum.exit_handler()` without `os._exit`, or a signal shutdown
+whose `detach_interfaces()` is slow) kept the RPC name bound on its own. A new
+host then bound `@rns/<instance>`, became the shared instance, and died in
+`__init__` building its RPC `Listener`: `OSError: [Errno 98] Address already
+in use`. Measured 2026-10-20 on the fleet's `1.3.8+mf.5`, as two separate
+processes with a random instance name: torn-down host alive → second host
+rc=3 EADDRINUSE; same start after it exited → rc=0, RPC answering. Raised by
+reviewer A of mf.3 (2026-10-01), unmeasured until now.
+
+Cure: `exit_handler()` calls `__release_rpc_listener()` right after
+`detach_interfaces()`, so both names go together. It `shutdown()`s the
+listening socket BEFORE `close()`: `rpc_loop` sits in `accept()`, and that
+in-flight syscall holds the socket, and so the abstract name, past a bare
+`close()`. `rpc_loop` exits when the listener is gone instead of logging the
+woken `accept()` as a client error. Test: `tests/meshforge_rpc_release.py`
+(fails on the unpatched tree with `@rns/<n>/rpc` still bound; also asserts
+the rpc thread exits). The cross-process drill flips rc=3 → rc=0. Local
+socket handling only; no wire or crypto change.
+
+Fleet exposure is narrow: `RNS.exit()` ends in `os._exit()`, and systemd
+restarts rnsd only after the old process is gone. The window is a process
+that host-fell-back (#69) and is shutting down slowly while rnsd starts.
+
 ### `1.3.8+mf.10` (UNRELEASED) — the congestion gate's exit uses BOTH of its observers, so quiet that the writer observed drained closes an episode, and an offer gap is no longer a reset
 
 Built red-first ON a 4 KB-page box (moc4, Raspberry Pi 4, Python 3.11.2,

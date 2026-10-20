@@ -51,6 +51,7 @@ from threading import Lock
 import RNS.vendor.umsgpack as mp
 import configparser
 import multiprocessing.connection
+import socket
 import importlib.util
 import threading
 import signal
@@ -196,6 +197,7 @@ class Reticulum:
         if not Reticulum.__exit_handler_ran:
             Reticulum.__exit_handler_ran = True
             if not Reticulum.__interface_detach_ran: RNS.Transport.detach_interfaces()
+            Reticulum.__release_rpc_listener()
             RNS.Transport.exit_handler()
             RNS.Identity.exit_handler()
 
@@ -203,6 +205,24 @@ class Reticulum:
 
             RNS.loglevel = RNS.LOG_NONE
             RNS._detach_stdout()
+
+    @staticmethod
+    def __release_rpc_listener():
+        # MeshForge fork: upstream never closed rpc_listener, so a process
+        # that outlived its teardown kept @rns/<instance>/rpc bound after
+        # detach released @rns/<instance> (mf.3). A new host then bound the
+        # shared-instance name and died building its RPC Listener with
+        # EADDRINUSE. shutdown() first: it wakes rpc_loop's blocking accept(),
+        # whose in-flight syscall would otherwise keep the socket (and so the
+        # abstract name) alive past close().
+        instance = Reticulum.__instance
+        listener = getattr(instance, "rpc_listener", None)
+        if listener is None: return
+        instance.rpc_listener = None
+        try: listener._listener._socket.shutdown(socket.SHUT_RDWR)
+        except Exception: pass
+        try: listener.close()
+        except Exception as e: RNS.log(f"Could not close RPC listener: {e}", RNS.LOG_ERROR)
 
     @staticmethod
     def __deferred_shutdown():
@@ -1316,7 +1336,9 @@ class Reticulum:
     def rpc_loop(self):
         while RNS.Transport._should_run:
             try:
-                conn = self.rpc_listener.accept()
+                listener = self.rpc_listener
+                if listener is None: break  # MeshForge fork: released at teardown
+                conn = listener.accept()
                 call = mp.unpackb(conn.recv_bytes())
 
                 if "get" in call:
@@ -1369,6 +1391,7 @@ class Reticulum:
                 conn.close()
 
             except Exception as e:
+                if self.rpc_listener is None: break  # accept() woken by teardown, not a client error
                 RNS.log("An error ocurred while handling RPC call from local client: "+str(e), RNS.LOG_ERROR)
 
     def get_rpc_client(self): return multiprocessing.connection.Client(self.rpc_addr, family=self.rpc_type, authkey=self.rpc_key)
