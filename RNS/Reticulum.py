@@ -220,7 +220,10 @@ class Reticulum:
         if listener is None: return
         instance.rpc_listener = None
         try: listener._listener._socket.shutdown(socket.SHUT_RDWR)
-        except Exception: pass
+        except Exception as e:
+            # Without the shutdown a blocked accept() keeps the name bound
+            # (the pre-fix leak); leave a witness instead of a silent fallback.
+            RNS.log(f"Could not shut down RPC listener socket, its name may stay bound: {e}", RNS.LOG_DEBUG)
         try: listener.close()
         except Exception as e: RNS.log(f"Could not close RPC listener: {e}", RNS.LOG_ERROR)
 

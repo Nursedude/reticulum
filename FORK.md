@@ -134,7 +134,12 @@ in-flight syscall holds the socket, and so the abstract name, past a bare
 `close()`. `rpc_loop` exits when the listener is gone instead of logging the
 woken `accept()` as a client error. Test: `tests/meshforge_rpc_release.py`
 (fails on the unpatched tree with `@rns/<n>/rpc` still bound; also asserts
-the rpc thread exits). The cross-process drill flips rc=3 → rc=0. Local
+the rpc thread exits). The cross-process drill flips rc=3 → rc=0. The TCP
+twin `tests/meshforge_rpc_release_tcp.py` (`shared_instance_type = tcp`) is
+also red on the parent: the control port stays bound. Non-author review
+SHIP-WITH-NOTES; its notes became that test, plus a LOG_DEBUG witness when
+the private `_listener._socket` is missing (that fallback is the old leak,
+no worse). Local
 socket handling only; no wire or crypto change.
 
 Fleet exposure is narrow: `RNS.exit()` ends in `os._exit()`, and systemd
