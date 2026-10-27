@@ -90,7 +90,30 @@ sdists and applied with `patch -p2 -F0`.
   resolved under rnsh's own configdir), interface frame-length guards
   (Backbone/TCP drop frames > `HW_MTU` + IFAC and cap buffers at 2×MTU),
   Link/Resource/Transport/Discovery changes, new `LOG_PATHING` level replacing
-  `Transport.PR_LOGLEVEL`. Which hunk is the security fix is UNKNOWN (withheld).
+  `Transport.PR_LOGLEVEL`.
+- **The withheld fix, identified (non-author Fable read 2026-10-26, author
+  re-read):** an **rnsh auth bypass → remote command execution** in 1.3.8.
+  `rnsh/session.py:203-207` (1.3.8): a non-allowed identity calls
+  `self.terminate(...)` and then falls through unconditionally to
+  `self.remote_identity = identity; self._set_state(LSSTATE_WAIT_VERS)`, after
+  which `VersionInfo → ExecuteCommand → _start_cmd` runs with no auth check —
+  any identity could run the listener's command inside the prune window. 1.3.9
+  gates every state on `authenticated` / `terminated` (`session.py:107,206,
+  298-303`) and `Link.py:972` lets a link's identity be set only once (no
+  post-auth swap). The fleet's exposure is latent (0 `rnsh -l` processes on
+  11 boxes) but the vulnerable entry point is installed on 8.
+- **Roll notes (same read):** (1) rnsh's identity MOVES from
+  `<reticulum>/storage/identities/rnsh[.svc]` to `<rnsh configdir>/identity
+  [.svc]`, and `-c` now means the rnsh dir (`--rnsconfig` = RNS dir) — an
+  existing rnsh identity is silently abandoned, not migrated (none found on
+  VolcanoAI; other boxes unchecked). (2) BackboneInterface gains a 12 h
+  fast-flap IP ban and `rnstatus` a `Blocked : N IPs` line (the fleet runs no
+  BackboneInterface; MeshForge's `rns_status_parser` ignores unknown lines).
+  (3) An invalid resource advert now tears the link down; legit 1.3.8
+  senders cannot trip the new 3 MiB check. (4) Upstream defects carried, fork
+  `+mf.1` candidates, not blockers: config `loglevel` clamp still 7;
+  `Discovery.py` `subprocess.run` has no timeout and a `dlat > 180` longitude
+  typo; `BackboneInterface.py:826` dereferences a None `parent_interface`.
 - **Wire-compat invariant:** `Packet.py` and `RNS/Cryptography/` are untouched
   by 1.3.9; IFAC key derivation keeps identical `hkdf(length=64, …,
   salt=ifac_salt, context=None)` arguments; `Resource.REJECTED` 0x00→0x09 is
