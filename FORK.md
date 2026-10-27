@@ -129,8 +129,12 @@ sdists and applied with `patch -p2 -F0`.
 - **Tests (this box, one process per file):** 13 `meshforge_*` files 0 failed;
   `tests.all` OK (skipped=1) ×2 — identical to the mf.11 baseline run the same
   way. ⚠️ `tests.link` packet tests are LOAD-SENSITIVE: under a concurrent full
-  MeshForge suite both trees failed them (baseline 4/5, port 5/5) — re-run the
-  interleaved A/B on a quiet box before tagging.
+  MeshForge suite both trees failed them (baseline 4/5, port 5/5). **Quiet-box
+  interleaved A/B done 2026-10-26:** `tests.link` 5× each (base 5/5 pass, port
+  4/5), then `test_03a/03b_packets` 10× each — **base 3/10 fail, port 3/10 fail**
+  (loadavg 0.9-2.1). Combined base 3/15, port 4/15: indistinguishable — a
+  pre-existing flake (Packet.py and the packet path are unchanged by 1.3.9),
+  not a port regression.
 - **Before roll (operator go):** quiet-box link A/B; tag `1.3.9+mf.0`; one-box
   canary (moc3) + wedge-probe/clean-stop soak + **public-net interop proof**;
   MeshAnchor follows in the same pair (MF-FORK-PIN in `requirements/rns.txt`,
