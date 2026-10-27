@@ -70,6 +70,50 @@ for the new base.
 
 ## Upstream merge history
 
+### `1.3.8+mf.11` → `1.3.9+mf.0` (2026-10-26, branch `port-1.3.9`, NOT tagged, NOT rolled)
+
+Adopted upstream `1.3.9` — published 2026-07-19 as a **"Critical Security
+Update" for rnsh** (details withheld upstream). Source of record: the PyPI
+sdist `rns-1.3.9.tar.gz` (sha256 prefix `fd3745c1aba4dcbf`), since upstream
+publishes off-GitHub; the 1.3.8→1.3.9 diff was taken between the two PyPI
+sdists and applied with `patch -p2 -F0`.
+
+- **Cut from the `1.3.8+mf.11` tag (`29c72f38`) — the code the fleet runs —
+  NOT from the `meshforge` branch head**, which also carries the paused
+  mf.6–mf.10 PipeInterface arc. Same side-release discipline as mf.11.
+- **Why now (measured 2026-10-26):** rnsh ships inside this fork
+  (`RNS/Utilities/rnsh/`) and its entry point is installed on 8 MeshForge boxes;
+  0 rnsh processes on all 11 boxes (latent: exposure needs `rnsh -l`). Every
+  1.3.9-changed file this fork had not patched was byte-identical to 1.3.8 —
+  the fork carried none of the update.
+- **Scope of 1.3.9** (22 files): rnsh (identity + `allowed_identities` now
+  resolved under rnsh's own configdir), interface frame-length guards
+  (Backbone/TCP drop frames > `HW_MTU` + IFAC and cap buffers at 2×MTU),
+  Link/Resource/Transport/Discovery changes, new `LOG_PATHING` level replacing
+  `Transport.PR_LOGLEVEL`. Which hunk is the security fix is UNKNOWN (withheld).
+- **Wire-compat invariant:** `Packet.py` and `RNS/Cryptography/` are untouched
+  by 1.3.9; IFAC key derivation keeps identical `hkdf(length=64, …,
+  salt=ifac_salt, context=None)` arguments; `Resource.REJECTED` 0x00→0x09 is
+  local status (it collided with `NONE`). BELIEVED from reading — the
+  public-net interop proof below is the check.
+- **Merge result:** 2 rejects, both trivial — `_version.py` (our marker) and
+  `Transport.start`'s `PR_LOGLEVEL` assignment (removed as upstream did; no
+  reader remains). 17 files are byte-identical to 1.3.9; the five fork-patched
+  files carry exactly the same delta size vs 1.3.9 as they did vs 1.3.8
+  (`Reticulum.py` 234, `__init__.py` 66, `Transport.py` 57, Backbone 2,
+  `_version.py` 2) — no patch lost or grown. Markers intact: `_rpc_recv` 22,
+  `DETACH_TIMEOUT` 9, `rpc_listener` 11.
+- **Tests (this box, one process per file):** 13 `meshforge_*` files 0 failed;
+  `tests.all` OK (skipped=1) ×2 — identical to the mf.11 baseline run the same
+  way. ⚠️ `tests.link` packet tests are LOAD-SENSITIVE: under a concurrent full
+  MeshForge suite both trees failed them (baseline 4/5, port 5/5) — re-run the
+  interleaved A/B on a quiet box before tagging.
+- **Before roll (operator go):** quiet-box link A/B; tag `1.3.9+mf.0`; one-box
+  canary (moc3) + wedge-probe/clean-stop soak + **public-net interop proof**;
+  MeshAnchor follows in the same pair (MF-FORK-PIN in `requirements/rns.txt`,
+  `parity_check`).
+
+
 ### `1.2.5+mf.5` → `1.3.8+mf.0` (2026-07-17)
 
 Adopted upstream `1.3.8`. Wire-compat invariant cleared (crypto primitives

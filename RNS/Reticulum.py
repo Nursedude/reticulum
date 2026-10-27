@@ -916,6 +916,7 @@ class Reticulum:
         latitude = None
         longitude = None
         height = None
+        discovery_location = None
         discovery_frequency = None
         discovery_bandwidth = None
         discovery_modulation = None
@@ -933,6 +934,7 @@ class Reticulum:
                 if "discovery_encrypt" in c: discovery_encrypt = c.as_bool("discovery_encrypt")
                 if "reachable_on" in c: reachable_on = c["reachable_on"]
                 if "publish_ifac" in c: publish_ifac = c.as_bool("publish_ifac")
+                if "location_cmd" in c: discovery_location = c["location_cmd"]
                 if "latitude" in c: latitude = c.as_float("latitude")
                 if "longitude" in c: longitude = c.as_float("longitude")
                 if "height" in c: height = c.as_float("height")
@@ -940,14 +942,14 @@ class Reticulum:
                 if "discovery_bandwidth" in c: discovery_bandwidth = c.as_int("discovery_bandwidth")
                 if "discovery_modulation" in c: discovery_modulation = c.as_int("discovery_modulation")
 
-                if not interface_mode in [Interface.Interface.MODE_GATEWAY, Interface.Interface.MODE_ACCESS_POINT]:
+                if not interface_mode in [Interface.Interface.MODE_GATEWAY, Interface.Interface.MODE_ACCESS_POINT, Interface.Interface.MODE_INTERNAL]:
                     if not ignore_config_warnings:
                         if c["type"] in ["RNodeInterface", "RNodeMultiInterface"]:
                             interface_mode = Interface.Interface.MODE_ACCESS_POINT
-                            RNS.log(f"Discovery enabled on interface {name} without gateway or AP mode. Auto-configured to AP mode.", RNS.LOG_NOTICE)
+                            RNS.log(f"Discovery enabled on interface {name} without gateway, internal or AP mode. Auto-configured to AP mode.", RNS.LOG_NOTICE)
                         else:
                             interface_mode = Interface.Interface.MODE_GATEWAY
-                            RNS.log(f"Discovery enabled on interface {name} without gateway or AP mode. Auto-configured to gateway mode.", RNS.LOG_NOTICE)
+                            RNS.log(f"Discovery enabled on interface {name} without gateway, internal or AP mode. Auto-configured to gateway mode.", RNS.LOG_NOTICE)
                 
         try:
             def interface_post_init(interface):
@@ -971,6 +973,7 @@ class Reticulum:
                     interface.discovery_name                  = discovery_name
                     interface.discovery_encrypt               = discovery_encrypt
                     interface.discovery_stamp_value           = discovery_stamp_value
+                    interface.discovery_location              = discovery_location
                     interface.discovery_latitude              = latitude
                     interface.discovery_longitude             = longitude
                     interface.discovery_height                = height
@@ -1580,6 +1583,9 @@ class Reticulum:
                     if interface.announce_queue != None: ifstats["announce_queue"] = len(interface.announce_queue)
                     else:                                ifstats["announce_queue"] = None
 
+                if hasattr(interface, "blocked_ip_count"):
+                    ifstats["blocked_ips"] = interface.blocked_ip_count
+
                 ifstats["name"]                        = str(interface)
                 ifstats["short_name"]                  = str(interface.name)
                 ifstats["hash"]                        = interface.get_hash()
@@ -2060,7 +2066,7 @@ instance_name = default
 
 
 [logging]
-# Valid log levels are 0 through 7:
+# Valid log levels are 0 through 8:
 #   0: Log only critical information
 #   1: Log errors and lower log levels
 #   2: Log warnings and lower log levels
@@ -2068,7 +2074,8 @@ instance_name = default
 #   4: Log info and lower (this is the default)
 #   5: Verbose logging
 #   6: Debug logging
-#   7: Extreme logging
+#   7: Path logging
+#   8: Extreme logging
 
 loglevel = 4
 
