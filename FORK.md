@@ -70,7 +70,7 @@ for the new base.
 
 ## Upstream merge history
 
-### `1.3.8+mf.11` → `1.3.9+mf.0` (2026-10-26, branch `port-1.3.9`, NOT tagged, NOT rolled)
+### `1.3.8+mf.11` → `1.3.9+mf.0` (2026-10-26, branch `port-1.3.9`, tagged `1.3.9+mf.0` → `e915dcf4`; moc3 canary 2026-10-26 19:39)
 
 Adopted upstream `1.3.9` — published 2026-07-19 as a **"Critical Security
 Update" for rnsh** (details withheld upstream). Source of record: the PyPI
@@ -102,6 +102,16 @@ sdists and applied with `patch -p2 -F0`.
   298-303`) and `Link.py:972` lets a link's identity be set only once (no
   post-auth swap). The fleet's exposure is latent (0 `rnsh -l` processes on
   11 boxes) but the vulnerable entry point is installed on 8.
+- **Measured, not read** (2026-10-26, `tests/meshforge_rnsh_auth_bypass.py`,
+  committed after the tag — test only, no code change): drives a
+  ListenerSession through identify → VersionInfo → ExecuteCommand with the
+  spawn replaced by a recorder. On `1.3.8+mf.11` the non-allowed identity
+  reaches the spawn (`['/bin/true']`) — FAIL; on stock `1.3.9` and
+  `1.3.9+mf.0` it does not — OK; the allowed-identity control spawns on all
+  three, so a refuse-everyone tree cannot pass. ⚠️ A first draft called
+  `_start_cmd()` directly and read REFUSED on 1.3.9 — over-determined, since
+  1.3.9 also refuses any spawn outside `LSSTATE_RUNNING`; the control caught
+  it. Same test rc=0 on all four moc3 envs after the canary install.
 - **Roll notes (same read):** (1) rnsh's identity MOVES from
   `<reticulum>/storage/identities/rnsh[.svc]` to `<rnsh configdir>/identity
   [.svc]`, and `-c` now means the rnsh dir (`--rnsconfig` = RNS dir) — an
