@@ -7,11 +7,12 @@ measurement and decision is in [`FORK_HISTORY.md`](FORK_HISTORY.md).
 
 ## Now
 
-- **Shipped:** `1.3.9+mf.0`, tag `e915dcf4` on branch `port-1.3.9`, rolled to the MeshForge
+- **Shipped:** `1.3.9+mf.0`, tag `e915dcf4` on branch `meshforge`, rolled to the MeshForge
   fleet 2026-10-27. Base is upstream `1.3.9`, taken from the PyPI sdist because upstream
   publishes off-GitHub.
-- **Branch `meshforge`** also carries a paused, unreleased PipeInterface arc (`mf.6`–`mf.10`).
-  It is not in any shipped tag after `mf.5`.
+- **Branches:** `meshforge` is the shipped line. `pipe-arc-paused` holds a paused, unreleased
+  PipeInterface arc (`mf.6`–`mf.10`) that no shipped tag after `mf.5` contains. `master` is
+  upstream's `1.2.5` base.
 - **Versions:** `<upstream base>+mf.N`. `N` resets to 0 on a new upstream base.
 
 ## Why
@@ -51,7 +52,8 @@ at the source.
 
 ## Adopting a new upstream release
 
-1. Merge the new release into a branch cut from the **shipped tag**, not the `meshforge` head.
+1. Merge the new release into a branch cut from the **shipped tag** (`meshforge`), never from
+   `pipe-arc-paused`.
 2. Re-validate every carried patch against the new base; an auto-merge is not proof.
 3. Public-network interop proof (a stock announce plus an LXMF round trip), a one-box
    canary, then the fleet roll.
